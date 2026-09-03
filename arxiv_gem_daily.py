@@ -511,6 +511,7 @@ def main() -> int:
             score_lines = [ln.strip() for ln in text.splitlines()
                            if re.search(r"AGENT\s*\d\s*/\s*5", ln, re.I)]
             n_rec = len(re.findall(r"RECOMMENDED", text, re.I))
+            log(f"Score lines parsed: {len(score_lines)}, recommended: {n_rec}")
             # 5a. matplotlib chart — precise data visualization
             chart = infographic.render_arxiv_chart(
                 score_lines, n_recommended=n_rec,
