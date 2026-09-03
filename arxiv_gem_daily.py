@@ -293,26 +293,35 @@ def _load_smtp_pass() -> str:
 
 
 def send_email(subject: str, html_body: str,
-               image_path: str | None = None, cid: str = "infographic") -> None:
+               image_paths: list[str] | str | None = None,
+               cids: list[str] | None = None) -> None:
+    """Send HTML email with optional inline CID images (chart, gemini banner)."""
+    if isinstance(image_paths, str):
+        image_paths = [image_paths]
+    image_paths = image_paths or []
+    cids = cids or [f"infographic{i}" for i in range(len(image_paths))]
     pus = SMTP_USER
     pas = _load_smtp_pass()
     if not pas:
         log("ERROR: no SMTP_PASS — cannot send email")
         return
-    if image_path and os.path.exists(image_path):
-        # mixed: related(html+png) inside alternative(plain/html)
+    if image_paths:
         alt = MIMEMultipart("alternative")
         alt.attach(MIMEText("Digest delivered as HTML — enable HTML view.",
                             "plain", "utf-8"))
         alt.attach(MIMEText(html_body, "html", "utf-8"))
         msg = MIMEMultipart("related")
         msg.attach(alt)
-        with open(image_path, "rb") as fh:
-            img = MIMEImage(fh.read())
-        img.add_header("Content-ID", f"<{cid}>")
-        img.add_header("Content-Disposition", "inline",
-                       filename=os.path.basename(image_path))
-        msg.attach(img)
+        for i, ip in enumerate(image_paths):
+            if not ip or not os.path.exists(ip):
+                continue
+            with open(ip, "rb") as fh:
+                img = MIMEImage(fh.read())
+            cid = cids[i] if i < len(cids) else f"infographic{i}"
+            img.add_header("Content-ID", f"<{cid}>")
+            img.add_header("Content-Disposition", "inline",
+                           filename=os.path.basename(ip))
+            msg.attach(img)
     else:
         msg = MIMEMultipart("alternative")
         msg.attach(MIMEText(html_body, "html", "utf-8"))
@@ -325,8 +334,7 @@ def send_email(subject: str, html_body: str,
         server.sendmail(pus, [RECIPIENT], msg.as_string())
         server.quit()
         log(f"Email sent to {RECIPIENT} ({len(html_body)} chars"
-            + (f", infographic={os.path.basename(image_path)}"
-               if image_path else "") + ")")
+            + (f", {len(image_paths)} image(s)" if image_paths else "") + ")")
     except Exception as e:  # noqa: BLE001
         log(f"ERROR sending email: {e}")
 
@@ -391,7 +399,8 @@ def md_to_htmlish(text: str) -> str:
 
 
 def render_email_digest(date_label: str, gemini_text: str,
-                        infographic_cid: str | None = None) -> str:
+                        infographic_cids: list[str] | None = None,
+                        img_sources: list[str] | None = None) -> str:
     css = """
     <style>
       body{font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;
@@ -407,14 +416,20 @@ def render_email_digest(date_label: str, gemini_text: str,
       .cap{color:#57606a;font-size:12px;margin-bottom:12px;}
 </style>"""
     info_html = ""
-    if infographic_cid:
-        info_html = (f"<h4>📌 Today at a glance</h4>"
-                     f"<img class='infographic' src='cid:{infographic_cid}' "
-                     f"alt='digest infographic'/>"
-                     f"<div class='cap'>Score chart rendered locally from the "
-                     f"digest data (matplotlib): AGENT = agent-harness "
-                     f"applicability, TUNE = trainable on a free Colab T4."
-                     f"</div><hr/>")
+    labels = ["Data-viz score chart (rendered locally from digest data: "
+              "AGENT = agent-harness applicability, TUNE = Colab-T4 "
+              "trainability)",
+              "AI dashboard illustration (Gemini image generation from the "
+              "same digest data)"]
+    if infographic_cids:
+        info_html = "<h4>📌 Today at a glance</h4>"
+        for i, cid in enumerate(infographic_cids):
+            cap = labels[i] if i < len(labels) else ""
+            info_html += (f"<img class='infographic' src='cid:{cid}' "
+                          f"alt='digest infographic {i+1}'/>")
+            if cap:
+                info_html += f"<div class='cap'>{cap}</div>"
+        info_html += "<hr/>"
     return (f"<html><head><meta charset='utf-8'>{css}</head><body>"
             f"<h1>arXiv cs.AI — Gemini Daily Digest</h1>"
             f"<div class='meta'>Generated {date_label}, model: Gemini Flash + "
@@ -486,36 +501,45 @@ def main() -> int:
     text = res.get("text", "")
     log(f"Gemini digest produced {len(text)} chars")
 
-    # 5. Conclusion infographic (Gemini web image gen; skip on any failure)
-    img_path = None
+    # 5. Conclusion infographics: matplotlib data-viz chart (primary) AND
+    #    Gemini dashboard (secondary, rich-context prompt). Both embedded
+    #    when available; each fails independently.
+    img_paths: list[str] = []
+    sources: list[str] = []
     if infographic is not None:
         try:
             score_lines = [ln.strip() for ln in text.splitlines()
                            if re.search(r"AGENT\s*\d\s*/\s*5", ln, re.I)]
             n_rec = len(re.findall(r"RECOMMENDED", text, re.I))
-            # Primary: real data-viz chart (score bars, ranking) rendered
-            # locally — precise text, actual visualization.
-            img_path = infographic.render_arxiv_chart(
-                score_lines, n_recommended=n_rec, filedate=now.strftime("%Y-%m-%d"))
-            source = "matplotlib"
-            # Fallback: Gemini decorative banner (image model garbles text,
-            # so only used when matplotlib is unavailable / chart failed)
-            if not img_path and infographic.matplotlib_available() is False:
-                prompt = infographic.build_arxiv_prompt(score_lines, n_rec)
-                if prompt:
-                    img_path = infographic.gen_image(
-                        prompt, os.path.join(infographic.OUT_ROOT, "arxiv"))
-                    source = "gemini"
-            log(f"Infographic ({source}): "
-                f"{img_path or 'generation failed — skipped'}")
+            # 5a. matplotlib chart — precise data visualization
+            chart = infographic.render_arxiv_chart(
+                score_lines, n_recommended=n_rec,
+                filedate=now.strftime("%Y-%m-%d"))
+            if chart:
+                img_paths.append(chart)
+                sources.append("matplotlib")
+            # 5b. Gemini image-gen — stylistic dashboard with the rich
+            #     leaderboard/takeaway prompt (papers + summaries context)
+            papers_ctx = infographic.parse_score_lines(score_lines)
+            prompt = infographic.build_arxiv_prompt(
+                score_lines, n_rec, papers=papers_ctx, digest_text=text)
+            if prompt:
+                gem = infographic.gen_image(
+                    prompt, os.path.join(infographic.OUT_ROOT, "arxiv"),
+                    retries=1, timeout=280)
+                if gem:
+                    img_paths.append(gem)
+                    sources.append("gemini")
+            log(f"Infographics ({'+'.join(sources) or 'none'}): {len(img_paths)} image(s)")
         except Exception as e:  # noqa: BLE001
             log(f"Infographic skipped: {e}")
 
-    # 6. Compose + email
+    # 6. Compose + email (chart and gemini banner get separate CIDs)
     html = render_email_digest(date_label, text,
-                               infographic_cid="infographic" if img_path else None)
+                               infographic_cids=[f"infographic{i}" for i in range(len(img_paths))],
+                               img_sources=sources)
     subject = f"[arXiv cs.AI digest] {now.strftime('%Y-%m-%d')} — {len(candidates)} new papers"
-    send_email(subject, html, image_path=img_path)
+    send_email(subject, html, image_paths=img_paths)
 
     log(f"Done in {time.time()-start_all:.0f}s")
     return 0
