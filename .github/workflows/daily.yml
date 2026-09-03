@@ -2,13 +2,11 @@ name: arXiv cs.AI Daily Digest (Gemini)
 
 on:
   schedule:
-    # 02:00 UTC = 10:00 HKT daily. 3-day back-window + id dedup means no paper
-    # is dropped even if a run is late/skips a day.
     - cron: "0 2 * * *"
   workflow_dispatch:
     inputs:
       back_days:
-        description: "Override lookback window (days)"
+        description: "Override lookback window (days; default 2)"
         required: false
         default: ""
         type: string

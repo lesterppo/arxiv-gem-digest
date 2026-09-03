@@ -66,7 +66,7 @@ SMTP_USER = os.environ.get("SMTP_USER", "")   # sender email (GitHub secret / en
 RECIPIENT = os.environ.get("RECIPIENT", SMTP_USER)
 
 # Timing
-RUN_BACK_DAYS = int(os.environ.get("RUN_BACK_DAYS", "3"))  # overlap >= 2 runs
+RUN_BACK_DAYS = int(os.environ.get("RUN_BACK_DAYS", "2"))  # 2-day screen window
 MAX_ABSTRACT_CANDIDATES = int(os.environ.get("MAX_CANDIDATES", "22"))
 ABSTRACT_CHARS = 1200            # arXiv abstract char budget sent to Gemini per paper
 GEMINI_MODEL = "flash"           # Gemini Flash
@@ -491,11 +491,21 @@ def main() -> int:
             score_lines = [ln.strip() for ln in text.splitlines()
                            if re.search(r"AGENT\s*\d\s*/\s*5", ln, re.I)]
             n_rec = len(re.findall(r"RECOMMENDED", text, re.I))
-            prompt = infographic.build_arxiv_prompt(score_lines, n_rec)
-            if prompt:
-                img_path = infographic.gen_image(
-                    prompt, os.path.join(infographic.OUT_ROOT, "arxiv"))
-                log(f"Infographic: {img_path or 'generation failed — skipped'}")
+            # Primary: real data-viz chart (score bars, ranking) rendered
+            # locally — precise text, actual visualization.
+            img_path = infographic.render_arxiv_chart(
+                score_lines, n_recommended=n_rec, filedate=now.strftime("%Y-%m-%d"))
+            source = "matplotlib"
+            # Fallback: Gemini decorative banner (image model garbles text,
+            # so only used when matplotlib is unavailable / chart failed)
+            if not img_path and infographic.matplotlib_available() is False:
+                prompt = infographic.build_arxiv_prompt(score_lines, n_rec)
+                if prompt:
+                    img_path = infographic.gen_image(
+                        prompt, os.path.join(infographic.OUT_ROOT, "arxiv"))
+                    source = "gemini"
+            log(f"Infographic ({source}): "
+                f"{img_path or 'generation failed — skipped'}")
         except Exception as e:  # noqa: BLE001
             log(f"Infographic skipped: {e}")
 

@@ -15,7 +15,7 @@ Recommendation criteria scored per paper (1–5 each):
 ## How it works
 
 ```
-fetch cs.AI (arXiv API, ~3-day back-window)
+fetch cs.AI (arXiv API, 2-day back-window)
         │   arXiv date-range filter unsupported → pull newest 200/page,
         │   drop outside window, normalize id (strip vN)
         ▼

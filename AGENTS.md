@@ -14,7 +14,7 @@ If you are an AI agent told to modify or operate this repo, read the
 - **Backend model**: Gemini Flash + Extended Thinking via `gemini.py`
   (gemini-webapi, browser-cookie auth — NO API key). Cookies come from the
   `GEMINI_SID` / `GEMINI_TS` GitHub secrets, written to `~/.gemini-cli/auth.json`.
-- **No-miss guarantee**: `arxiv_gem_daily.py` fetches a `RUN_BACK_DAYS=3`
+- **No-miss guarantee**: `arxiv_gem_daily.py` fetches a `RUN_BACK_DAYS=2`
   window so a skipped/late daily run never drops a paper, and dedups on
   normalized arXiv id via `state/seen_ids.json` against double-reporting.
 - **arXiv API quirk**: `submittedDate:[...TO...]` range filters return HTTP
