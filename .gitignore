@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+state/*.md
+state/seen_ids.json
+!state/.gitkeep
+.DS_Store
+*.log

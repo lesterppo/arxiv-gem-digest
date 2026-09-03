@@ -1,0 +1,1408 @@
+#!/usr/bin/env python3
+"""
+gemini — AI-agent-native, token-efficient CLI for Gemini Web + Gems.
+Combines gem-cli (shared Gems, token-efficient output) + gemini.py (Gem CRUD, chat history).
+
+Always writes response to file; stdout gets a compact pointer JSON.
+5-tier auth: env vars → cached file → browser cookie scan → retry → login.
+
+Output: {"ok":true,"f":"./out.md","s":1234,"b":2,"imgs":3,
+         "model":"gemini-3-flash","gem":"GemName","c":"c_xxx","t":5}
+
+Repo: lesterppo/hermes-gem-cli (primary), lesterppo/gemini-web-cli (historical)
+"""
+import asyncio, argparse, json, os, re, sys, time, webbrowser
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ── WSL2 fix: curl_cffi hangs on WSL2 → urllib-based session ──
+# On WSL2, curl_cffi's async requests hang indefinitely. Native Linux
+# and GitHub Actions work fine with curl_cffi. Detect at import time.
+def _is_wsl2() -> bool:
+    """Return True if running on WSL2 (where curl_cffi hangs)."""
+    try:
+        with open("/proc/version") as f:
+            return "microsoft" in f.read().lower()
+    except Exception:
+        return False
+
+# SNlM0e is dead (Jul 2026); tokens fetched from gemini.google.com/app.
+def _wsl2_init_fix():
+    try:
+        import json, os, re, urllib.request, urllib.parse, random as _random
+        from pathlib import Path
+
+        # Import urllib session wrapper
+        _here = Path(__file__).resolve().parent
+        if str(_here) not in __import__("sys").path:
+            __import__("sys").path.insert(0, str(_here))
+        from urllib_session import UrllibSession
+
+        import gemini_webapi.utils.get_access_token as _gat
+
+        async def _patched_get_access_token(base_cookies, proxy=None, verbose=False, verify=True):
+            s = UrllibSession(impersonate="chrome", timeout=30)
+            if isinstance(base_cookies, dict):
+                for k, v in base_cookies.items():
+                    if v: s.cookies.set(k, v, domain=".google.com")
+            else:
+                try:
+                    for c in base_cookies.jar:
+                        s.cookies.set(c.name, c.value, domain=c.domain, path=c.path)
+                except Exception:
+                    for k, v in dict(base_cookies).items():
+                        if v: s.cookies.set(k, v, domain=".google.com")
+            try:
+                r = await s.get("https://gemini.google.com/app")
+                html = r.text
+                bl = (re.search(r'"cfb2h":\s*"(.*?)"', html) or [None,None])[1]
+                sid = (re.search(r'"FdrFJe":\s*"(.*?)"', html) or [None,None])[1]
+                lang = (re.search(r'"TuX5cc":\s*"(.*?)"', html) or [None,None])[1]
+                pid = (re.search(r'"qKIAYe":\s*"(.*?)"', html) or [None,None])[1]
+                return (None, bl, sid, lang, pid or "feeds/mcudyrk2a4khkz", s)
+            except Exception:
+                return (None, None, None, None, None, s)
+
+        _gat.get_access_token = _patched_get_access_token
+        # Also patch the client module's reference (the one init() actually calls)
+        try:
+            import gemini_webapi.client as _client_mod
+            _client_mod.get_access_token = _patched_get_access_token
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+if _is_wsl2():
+    _wsl2_init_fix()
+
+# ── Dependencies ─────────────────────────────────────────────
+
+try:
+    from gemini_webapi import GeminiClient
+    from gemini_webapi.client import Model as GeminiModel
+except ImportError:
+    print(json.dumps({"ok": False, "err": "DEP_MISSING",
+                       "msg": "gemini-webapi not installed. Run: pip install gemini-webapi"}))
+    sys.exit(1)
+
+import loguru as _loguru
+_loguru.logger.remove()
+_loguru.logger.add(sys.stderr, level="ERROR", format="<red>[gemini]</red> {message}")
+
+# ── Paths ────────────────────────────────────────────────────
+
+AUTH_CACHE = Path.home() / ".gemini-cli" / "auth.json"
+GEM_HOME = Path.home() / ".gemini-cli"
+SEARCH_GEM_PROMPT = Path(__file__).resolve().parent / "search-gem-prompt.txt"
+SEARCH_GEM_NAME = "Gemini search"
+SEARCH_GEM_DESC = "Headless Search Grounding Proxy — ultra-dense positional-array JSON for AI agents"
+
+# ── Auth ─────────────────────────────────────────────────────
+
+_GEM_URL_RE = re.compile(r'gemini\.google\.com/gem/([a-zA-Z0-9_-]+)')
+
+_AUTH_ERROR_PATTERNS = [
+    "UNAUTHENTICATED", "cookies have expired", "session is not authenticated",
+    "error code: 1100", "User is not authenticated",
+]
+_RATE_LIMIT_PATTERNS = [
+    "error code: 1097", "rate limit", "too many requests",
+    "quota exceeded", "resource has been exhausted",
+]
+
+def extract_gem_id(url: str) -> str:
+    m = _GEM_URL_RE.search(url)
+    if m: return m.group(1)
+    if '/' not in url and ' ' not in url and len(url) >= 5: return url
+    raise ValueError(f"Cannot extract Gem ID from: {url}")
+
+def is_auth_error(msg: str) -> bool:
+    u = msg.upper()
+    return any(p.upper() in u for p in _AUTH_ERROR_PATTERNS)
+
+def is_rate_limit(msg: str) -> bool:
+    u = msg.upper()
+    return any(p.upper() in u for p in _RATE_LIMIT_PATTERNS)
+
+def error_kind(msg: str) -> str:
+    if is_auth_error(msg): return "AUTH_EXPIRED"
+    if is_rate_limit(msg): return "RATE_LIMIT"
+    return "GEN_FAILED"
+
+# ── Model labels ─────────────────────────────────────────────
+
+_MODEL_LABEL_MAP = {
+    "BASIC_FLASH": "flash+standard",  "PLUS_FLASH": "flash+plus",
+    "ADVANCED_FLASH": "flash+extended", "BASIC_PRO": "pro+standard",
+    "PLUS_PRO": "pro+plus", "ADVANCED_PRO": "pro+extended",
+    "BASIC_THINKING": "thinking+standard", "PLUS_THINKING": "thinking+plus",
+    "ADVANCED_THINKING": "thinking+extended",
+    "gemini-3-flash": "flash", "gemini-3-pro": "pro",
+    "gemini-3-flash-lite": "lite", "gemini-3.5-flash-lite": "lite",
+    "gemini-3-flash-thinking": "thinking", "3.5 Flash-Lite": "lite",
+}
+
+_LITE_MODEL_DICT = {
+    "model_name": "Flash-Lite",
+    "model_header": {
+        "x-goog-ext-525001261-jspb": '[1,null,null,null,"8c46e95b1a07cecc",null,null,0,[4],null,null,1]',
+        "x-goog-ext-73010989-jspb": "[0]",
+        "x-goog-ext-73010990-jspb": "[0]",
+    },
+}
+
+_MODEL_ALIASES = {"pro": "PRO", "flash": "FLASH", "fast": "FLASH",
+                   "thinking": "THINKING", "think": "THINKING", "lite": "LITE"}
+_THINKING_ALIASES = {"standard": "BASIC", "basic": "BASIC",
+                      "plus": "PLUS", "extended": "ADVANCED", "advanced": "ADVANCED"}
+
+def friendly_model_label(model) -> str:
+    if isinstance(model, dict):
+        return _MODEL_LABEL_MAP.get(model.get("model_name", ""), model.get("model_name", "lite"))
+    if hasattr(model, 'name'):
+        return _MODEL_LABEL_MAP.get(model.name, model.name.lower())
+    if isinstance(model, str):
+        return _MODEL_LABEL_MAP.get(model, model.lower())
+    return str(model)
+
+def resolve_model_enum(model_str: str | None, thinking: str | None = None):
+    if not model_str: return None
+    tier = _THINKING_ALIASES.get(thinking.lower().strip(), thinking.upper()) if thinking else None
+    mtype = _MODEL_ALIASES.get(model_str.lower().strip())
+    if mtype is None: return model_str
+    if mtype == "LITE": return dict(_LITE_MODEL_DICT)
+    if tier:
+        try: return GeminiModel[f"{tier}_{mtype}"]
+        except KeyError: return model_str
+    return model_str
+
+def resolve_model_string(client, model_str: str) -> str:
+    q = model_str.lower().strip()
+    if q in ("thinking", "think"):
+        try: return GeminiModel.BASIC_THINKING
+        except AttributeError: pass
+    try:
+        available = client.list_models()
+        known = {"8c46e95b1a07cecc": "Flash-Lite",
+                 "56fdd199312815e2": "gemini-3-flash",
+                 "e6fa609c3fa255c0": "gemini-3-pro"}
+        name_map = {known.get(m.model_id, str(m).lower()):
+                     known.get(m.model_id, str(m)) for m in available}
+    except Exception:
+        return model_str
+    if q in name_map: return name_map[q]
+    matches = [v for k, v in name_map.items() if q in k]
+    if len(matches) == 1: return matches[0]
+    if q in ("flash", "fast"):
+        return next((v for k, v in name_map.items()
+                     if "flash" in k and "lite" not in k and "thinking" not in k), model_str)
+    if q in ("pro",):
+        return next((v for k, v in name_map.items()
+                     if "pro" in k and "thinking" not in k), model_str)
+    if q in ("lite",):
+        matches = [v for k, v in name_map.items() if "flash-lite" in k.lower() or "lite" in k.lower()]
+        if matches: return matches[0]
+        return dict(_LITE_MODEL_DICT)
+    return model_str
+
+# ── 5-tier auth chain ────────────────────────────────────────
+
+def _load_auth_cache() -> tuple:
+    try:
+        if AUTH_CACHE.exists():
+            d = json.loads(AUTH_CACHE.read_text())
+            sid = d.get("__Secure-1PSID") or d.get("sid")
+            ts = d.get("__Secure-1PSIDTS") or d.get("ts")
+            if sid: return sid, ts
+    except Exception: pass
+    return None, None
+
+def _save_auth_cache(sid: str, ts: str | None):
+    AUTH_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    AUTH_CACHE.write_text(json.dumps({
+        "__Secure-1PSID": sid, "__Secure-1PSIDTS": ts or "",
+        "updated": datetime.now(timezone.utc).isoformat(),
+    }))
+
+def _scan_browser_cookies(preferred: str | None = None) -> tuple:
+    try: import browser_cookie3
+    except ImportError: return None, None
+    order = [('chrome', browser_cookie3.chrome), ('firefox', browser_cookie3.firefox),
+             ('edge', browser_cookie3.edge), ('safari', browser_cookie3.safari)]
+    if preferred:
+        for i, (n, _) in enumerate(order):
+            if n == preferred.lower():
+                order.insert(0, order.pop(i)); break
+    for name, fn in order:
+        try:
+            cj = fn(domain_name='.google.com')
+            sid = ts = None
+            for c in cj:
+                if c.name == '__Secure-1PSID': sid = c.value
+                elif c.name == '__Secure-1PSIDTS': ts = c.value
+            if sid: return sid, ts
+        except Exception: continue
+    return None, None
+
+def _browser_login(preferred: str | None = None) -> tuple:
+    if not sys.stdout.isatty(): return None, None
+    print("[gemini] Opening gemini.google.com for login...", file=sys.stderr)
+    webbrowser.open("https://gemini.google.com")
+    for i in range(40):
+        time.sleep(3)
+        sid, ts = _scan_browser_cookies(preferred=preferred)
+        if sid:
+            _save_auth_cache(sid, ts); return sid, ts
+    return None, None
+
+def resolve_auth(preferred_browser: str | None = None, allow_login: bool = False) -> tuple:
+    sid = os.getenv("GEMINI_SID"); ts = os.getenv("GEMINI_TS")
+    if sid: return sid, ts
+    sid, ts = _load_auth_cache()
+    if sid: return sid, ts
+    sid, ts = _scan_browser_cookies(preferred=preferred_browser)
+    if sid: _save_auth_cache(sid, ts); return sid, ts
+    if allow_login:
+        sid, ts = _browser_login(preferred=preferred_browser)
+        if sid: return sid, ts
+    print(json.dumps({"ok": False, "err": "AUTH_EXPIRED",
+                       "msg": "No Gemini cookies. Set GEMINI_SID/TS, run --init, or --login."}))
+    sys.exit(1)
+
+def refresh_auth(preferred: str | None = None) -> tuple:
+    sid, ts = _scan_browser_cookies(preferred=preferred)
+    if sid: _save_auth_cache(sid, ts)
+    return sid, ts
+
+# ── Browser-shaped batchexecute (works around gemini_webapi 2.x header/payload gaps) ──
+# Root cause found 2026-09-01: lib's _batch_execute omits Origin/Referer/X-Same-Domain
+# headers and sends f.req single-wrapped; server then rejects read-RPCs (MaZiqc, hNvQHb,
+# CNgdBe, oMH3Zd...) with [\"e\",4,null,null,NNN]. Browser-shaped POST returns 200.
+_BROWSER_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
+
+class BrowserBatchRPC:
+    """Direct batchexecute client with full browser cookie set + browser-shaped payload."""
+
+    def __init__(self, sid: str, ts: str | None = None):
+        self.sid = sid
+        self.ts = ts
+        self.session = None
+        self.at = None
+        self.bl = ""
+
+    async def init(self):
+        from curl_cffi.requests import AsyncSession
+        import browser_cookie3
+        self.session = AsyncSession(impersonate="chrome145")
+        # Full .google.com cookie set from Firefox (auth needs more than 2 cookies for reads)
+        try:
+            cj = browser_cookie3.firefox()
+            for c in cj:
+                if (c.domain or "") == ".google.com":
+                    self.session.cookies.set(c.name, c.value, domain=".google.com", secure=True)
+        except Exception:
+            pass  # fall back to the 2 core cookies
+        if self.sid and "__Secure-1PSID" not in [c.name for c in self.session.cookies.jar]:
+            self.session.cookies.set("__Secure-1PSID", self.sid, domain=".google.com", secure=True)
+        if self.ts:
+            self.session.cookies.set("__Secure-1PSIDTS", self.ts, domain=".google.com", secure=True)
+        r = await self.session.get("https://gemini.google.com/app", headers={"User-Agent": _BROWSER_UA})
+        m = re.search(r'"SNlM0e":"(.*?)"', r.text)
+        self.at = m.group(1) if m else None
+        mb = re.search(r'"cfb2h":"(.*?)"', r.text)
+        self.bl = mb.group(1) if mb else ""
+        if not self.at:
+            raise RuntimeError("AUTH_EXPIRED: no SNlM0e in /app HTML (not signed in?)")
+        return self
+
+    async def rpc(self, rpcid: str, payload, retries: int = 2):
+        from urllib.parse import urlencode
+        freq = json.dumps([[["%s" % rpcid, payload if isinstance(payload, str) else json.dumps(payload), None, "generic"]]])
+        body = urlencode({
+            "rpcids": rpcid, "source-path": "/app", "bl": self.bl, "hl": "en",
+            "f.req": freq, "at": self.at,
+        })
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+            "Origin": "https://gemini.google.com",
+            "Referer": "https://gemini.google.com/app",
+            "X-Same-Domain": "1",
+            "User-Agent": _BROWSER_UA,
+        }
+        last = None
+        for attempt in range(retries + 1):
+            r = await self.session.post(
+                "https://gemini.google.com/_/BardChatUi/data/batchexecute",
+                data=body, headers=headers)
+            if r.status_code == 200 and '["e",4' not in r.text[:2000]:
+                return r.text
+            last = r
+            if attempt < retries:
+                await asyncio.sleep(2 * (attempt + 1))
+        raise RuntimeError(f"RPC {rpcid} failed: HTTP {last.status_code} {last.text[:120]}")
+
+    async def close(self):
+        try: await self.session.close()
+        except Exception: pass
+
+def _extract_rpc_payloads(rpc_text: str, rpcid: str) -> list:
+    """Pull inner JSON payloads for target rpcid from batchexecute response."""
+    from gemini_webapi.utils.parsing import extract_json_from_response, get_nested_value
+    out = []
+    try:
+        for part in extract_json_from_response(rpc_text):
+            if get_nested_value(part, [1]) != rpcid:
+                continue
+            body = get_nested_value(part, [2])
+            if not body: continue
+            try: out.append(json.loads(body))
+            except (json.JSONDecodeError, TypeError): continue
+    except Exception: pass
+    return out
+
+# ── Image detection ──────────────────────────────────────────
+
+_IMG_GEN_STARTS = ["generate an image", "create an image", "make an image",
+                    "draw a", "generate a photo", "create a picture"]
+_IMG_GEN_KW = _IMG_GEN_STARTS + ["show me a picture", "show me an image",
+                                  "generate", "create", "draw", "illustrate", "paint"]
+
+def looks_like_image_gen(prompt: str) -> bool:
+    p = prompt.lower().strip()
+    for kw in _IMG_GEN_STARTS:
+        if p.startswith(kw): return True
+    return sum(1 for kw in _IMG_GEN_KW if kw in p) >= 2
+
+# ── Conversation state ───────────────────────────────────────
+
+class ChatRef:
+    def __init__(self, metadata: list):
+        self.metadata = metadata
+
+def load_conv(path: str) -> dict | None:
+    p = Path(path)
+    if not p.exists(): return None
+    try:
+        s = json.loads(p.read_text(encoding="utf-8"))
+        if s.get("metadata") and len(s["metadata"]) >= 1: return s
+    except (json.JSONDecodeError, KeyError): pass
+    return None
+
+def save_conv(path: str, state: dict):
+    state["updated"] = datetime.now(timezone.utc).isoformat()
+    Path(path).write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+# ── Helpers ──────────────────────────────────────────────────
+
+def fail(code: str, msg: str, extra: dict | None = None):
+    out = {"ok": False, "err": code, "msg": msg}
+    if extra: out.update(extra)
+    print(json.dumps(out)); sys.exit(1)
+
+# ── Main CLI class ───────────────────────────────────────────
+
+class GeminiCLI:
+    def __init__(self):
+        self.client = None
+        self.raw_mode = False
+
+    def log(self, msg: str):
+        if not self.raw_mode:
+            print(f"[gemini] {msg}", file=sys.stderr)
+
+    def pointer(self, out_path: Path, conv_state: dict | None = None,
+                images: list | None = None, videos: list | None = None, media: list | None = None,
+                code_blocks: int = 0, thoughts: bool = False,
+                model_label: str = "", gem_name: str = "", deep_research: bool = False, temporary: bool = False):
+        p = {"ok": True, "f": self._short(out_path), "s": out_path.stat().st_size}
+        if code_blocks: p["b"] = code_blocks
+        if images: p["imgs"] = len(images)
+        if videos: p["vids"] = len(videos)
+        if media: p["media"] = len(media)
+        if thoughts: p["thoughts"] = True
+        if model_label: p["model"] = model_label
+        if gem_name: p["gem"] = gem_name
+        if deep_research: p["dr"] = True
+        if temporary: p["tmp"] = True
+        if conv_state:
+            p["c"] = conv_state.get("cid")
+            p["t"] = conv_state.get("turns")
+        print(json.dumps(p))
+
+    @staticmethod
+    def _short(p: Path) -> str:
+        try: return "./" + str(p.resolve().relative_to(Path.cwd())).replace("\\", "/")
+        except ValueError: return str(p.resolve())
+
+    def parse_code_blocks(self, text: str) -> list:
+        return [{"lang": m[0], "code": m[1].strip()}
+                for m in re.findall(r"```(\w*)\n(.*?)```", text, re.DOTALL)]
+
+    def _pw_fallback(self, gem_id: str, prompt: str, output: str | None = None):
+        """Playwright browser fallback for Gem operations."""
+        try:
+            import subprocess
+            pw = str(Path(__file__).resolve().parent / "gem-pw")
+            args = [sys.executable, pw, gem_id]
+            if output: args.extend(["-o", output])
+            args.append(prompt)
+            r = subprocess.run(args, capture_output=True, text=True, timeout=180)
+            if r.returncode == 0 and r.stdout.strip():
+                pwj = json.loads(r.stdout.strip())
+                if pwj.get("ok"): return pwj
+        except Exception: pass
+        return None
+
+    async def run(self):
+        if hasattr(sys.stdout, 'reconfigure'):
+            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+
+        p = argparse.ArgumentParser(
+            description="gemini — AI-agent-native CLI for Gemini Web + Gems",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog="""Examples:
+  gemini AbCdEf1234 "Hello"                          # chat with a Gem
+  gemini AbCdEf1234 -c sess.json --new "start"        # multi-turn
+  gemini AbCdEf1234 -f report.pdf -m pro "analyze"    # file upload
+  gemini AbCdEf1234 -i chart.png "explain trend"      # image upload
+  gemini AbCdEf1234 --img "a cat flying"              # image generation
+  gemini AbCdEf1234 --deep-research "topic"           # deep research
+  gemini --init                                        # cache auth
+  gemini --login                                       # browser login
+  gemini --list-models                                 # available models
+  gemini --list-gems                                   # your Gems
+  gemini --create-gem MyGem -p "system prompt"        # create Gem
+  gemini --edit-gem MyGem -n "NewName" -d "Desc"      # edit Gem
+  gemini --delete-gem AbCdEf1234                       # delete Gem
+  gemini --list-chats                                  # chat history
+  gemini --read-chat c_xxx                             # read a chat
+  gemini --fetch-latest c_xxx                          # fetch latest turn
+  gemini --deep-research-status <research_id>          # research status
+  gemini --account-status                              # check account
+  gemini --setup-search-gem                            # create search Gem
+  gemini -p "prompt" --temporary                       # temporary chat
+  gemini -p "prompt" --show-thoughts -m thinking       # show thinking traces
+  gemini -p "hi" --save-videos ./vids                  # save Veo videos
+
+Output: compact JSON pointer on stdout, full response on disk.""")
+        
+        # Core
+        p.add_argument("url", nargs="?", help="Shared Gem URL or Gem ID")
+        p.add_argument("prompt", nargs="*", help="Prompt text (reads stdin if empty)")
+        # Files
+        p.add_argument("-i", "--image", action="append", dest="images", default=[], metavar="FILE")
+        p.add_argument("-f", "--file", action="append", dest="files", default=[], metavar="FILE")
+        # Conversation
+        p.add_argument("-c", "--conversation", metavar="FILE", help="Conversation state file")
+        p.add_argument("--new", action="store_true", dest="new_conv", help="Start fresh")
+        # Model
+        p.add_argument("-m", "--model", choices=["flash","pro","thinking","lite"],
+                       help="Model: flash, pro, thinking, lite")
+        p.add_argument("--thinking", choices=["standard","plus","extended"],
+                       help="Thinking tier")
+        # Image gen
+        p.add_argument("--img-gen", action="store_true", dest="image_gen", help="Force image gen")
+        p.add_argument("--img", dest="image_prompt", metavar="PROMPT", help="Generate image")
+        # Deep research
+        p.add_argument("--deep-research", action="store_true", dest="deep_research",
+                       help="Deep research mode (~1-10 min)")
+        # Streaming
+        p.add_argument("--stream", action="store_true", dest="stream",
+                       help="Stream tokens in real-time")
+        # Output
+        p.add_argument("-o", "--output", metavar="FILE", help="Output file")
+        p.add_argument("--json-out", action="store_true", help="Write .json not .md")
+        p.add_argument("--brief", action="store_true", help="Prepend 'Be concise.'")
+        p.add_argument("-q", "--quiet", action="store_true", help="Suppress stderr")
+        p.add_argument("--raw", action="store_true", dest="raw_mode", help="Zero stderr")
+        # Auth
+        p.add_argument("--browser", choices=["chrome","firefox","edge","safari"], help="Browser for cookies")
+        p.add_argument("--init", action="store_true", help="Cache auth tokens from browser")
+        p.add_argument("--login", action="store_true", help="Open browser for login")
+        p.add_argument("-p", "--prompt-flag", dest="prompt_flag", help="Prompt (alt to positional/stdin)")
+        # Gem CRUD
+        p.add_argument("--create-gem", dest="create_gem_name", metavar="NAME", help="Create a new Gem")
+        p.add_argument("--edit-gem", dest="edit_gem_id", metavar="ID_OR_NAME",
+                       help="Edit an existing Gem")
+        p.add_argument("-n", "--new-name", dest="edit_new_name", help="New name for --edit-gem")
+        p.add_argument("-d", "--desc", dest="edit_new_desc", help="New description for --edit-gem")
+        p.add_argument("-S", "--system-instruction", dest="edit_sys_instr",
+                       help="System instruction for --create-gem or --edit-gem")
+        p.add_argument("--delete-gem", dest="delete_gem_id", metavar="ID", help="Delete a Gem")
+        p.add_argument("--gem-info", action="store_true", help="Fetch Gem metadata")
+        p.add_argument("--clear", action="store_true", dest="clear_conv", help="Delete conv file")
+        # Discovery
+        p.add_argument("--list-models", action="store_true", help="List models")
+        p.add_argument("--list-gems", action="store_true", help="List Gems")
+        p.add_argument("--list-chats", action="store_true", help="List chat history")
+        p.add_argument("--read-chat", dest="read_chat_id", metavar="CID", help="Read a chat by ID")
+        p.add_argument("--delete-chat", dest="delete_chat_id", metavar="CID", help="Delete a chat")
+        p.add_argument("-l", "--limit", type=int, default=50, help="Limit for list commands")
+        # Account
+        p.add_argument("--account-status", action="store_true", help="Check account status")
+        # Search Gem
+        p.add_argument("--setup-search-gem", action="store_true", help="Create search grounding Gem")
+        # Save images/videos/media
+        p.add_argument("--save-images", metavar="DIR", help="Save generated images to DIR")
+        p.add_argument("--save-videos", metavar="DIR", help="Save generated videos to DIR")
+        p.add_argument("--save-media", metavar="DIR", help="Save generated media (audio/video) to DIR")
+        # Chat modes
+        p.add_argument("--temporary", action="store_true", help="Temporary chat (not saved to history)")
+        p.add_argument("--show-thoughts", action="store_true", help="Include thinking traces in output")
+        # Additional fetchers
+        p.add_argument("--fetch-latest", dest="fetch_latest_id", metavar="CID", help="Fetch latest turn for chat CID")
+        p.add_argument("--deep-research-status", dest="deep_research_status_id", metavar="ID", help="Get deep research status by research ID")
+        p.add_argument("--extract-canvas", metavar="FILE", help="Save Canvas/HTML artifact to FILE")
+        # Timing
+        p.add_argument("-t", "--timeout", type=int, default=120, help="Max seconds (default 120)")
+        p.add_argument("--no-retry", action="store_true", help="Disable auto-retry")
+        p.add_argument("--extract-code", type=int, dest="extract_code", metavar="N",
+                       help="Save Nth code block to file")
+        p.add_argument("--resume", dest="resume_session", metavar="ID",
+                       help="Resume conversation by session ID")
+        p.add_argument("--timeout-soft", type=int, dest="timeout_soft", metavar="SEC",
+                       help="Warn at N seconds but keep waiting")
+        # Gem target (without URL)
+        p.add_argument("-g", "--gem", dest="gem_id", help="Gem ID for direct chat (no URL needed)")
+        
+        args = p.parse_intermixed_args()
+        self.raw_mode = args.raw_mode or args.quiet
+        
+        if self.raw_mode:
+            _loguru.logger.remove()
+            _loguru.logger.add(sys.stderr, level="CRITICAL")
+
+        # ── Standalone: --init ──
+        if args.init:
+            self.log("Extracting auth tokens from browser...")
+            sid = os.getenv("GEMINI_SID")
+            ts = os.getenv("GEMINI_TS")
+            if not sid: sid, ts = _scan_browser_cookies(preferred=args.browser or os.getenv("GEMINI_BROWSER"))
+            if sid:
+                _save_auth_cache(sid, ts)
+                print(json.dumps({"ok": True, "action": "init", "cached": str(AUTH_CACHE)}))
+            else:
+                fail("AUTH_EXPIRED", "No cookies found. Sign in at gemini.google.com first, or use --login.")
+            return
+
+        # ── Standalone: --login ──
+        if args.login:
+            sid, ts = _browser_login(preferred=args.browser or os.getenv("GEMINI_BROWSER"))
+            if sid:
+                print(json.dumps({"ok": True, "action": "login", "cached": str(AUTH_CACHE)}))
+            else:
+                fail("LOGIN_FAILED", "Login timed out.")
+            return
+
+        # ── Standalone: --account-status ──
+        if args.account_status:
+            sid, ts = resolve_auth(preferred_browser=args.browser or os.getenv("GEMINI_BROWSER"))
+            try:
+                from gemini_webapi.constants import GRPC as _GRPC, AccountStatus as _AS
+                from gemini_webapi.client import RPCData as _RPCData
+                from gemini_webapi.utils.parsing import extract_json_from_response as _extract, get_nested_value as _gv
+                client = GeminiClient(secure_1psid=sid, secure_1psidts=ts)
+                await client.init()
+                
+                result = {
+                    "ok": True,
+                    "status_code": int(client.account_status),
+                    "status_name": client.account_status.name,
+                    "status_desc": client.account_status.description,
+                    "language": client.language,
+                    "session_id": str(client.session_id),
+                    "build": client.build_label,
+                }
+                
+                # ── Email from HTML ──
+                try:
+                    r = await client.client.get("https://gemini.google.com/app")
+                    emails = set(re.findall(r'[\w.+-]+@gmail\.com', r.text))
+                    result["emails"] = sorted(emails)
+                except Exception:
+                    result["emails"] = []
+                
+                # ── Models ──
+                try:
+                    result["available_models"] = [str(m) for m in client.list_models()]
+                except Exception:
+                    result["available_models"] = []
+                
+                # ── Quota / usage limits ──
+                try:
+                    resp = await client._batch_execute([
+                        _RPCData(rpcid=_GRPC.DEEP_RESEARCH_MODEL_STATE,
+                                 payload="[[[1,11],[2,11],[6,11]]]"),
+                        _RPCData(rpcid=_GRPC.DEEP_RESEARCH_MODEL_STATE,
+                                 payload="[[[1,4],[2,4],[6,4]]]"),
+                    ])
+                    parts = _extract(resp.text)
+                    quotas = []
+                    for part in parts:
+                        body_str = _gv(part, [2])
+                        if not body_str: continue
+                        body = json.loads(body_str)
+                        # Format: [[[[None, model_id], ?, ?, [start_ts, end_ts], daily_limit, used], ...], '']
+                        entries = body[0] if isinstance(body, list) and body else []
+                        for entry in entries:
+                            if not isinstance(entry, list) or len(entry) < 6: continue
+                            quotas.append({
+                                "model_type": entry[0][1] if entry[0] else None,
+                                "model_hint": {4: "pro", 11: "flash"}.get(entry[0][1] if entry[0] else 0, "unknown"),
+                                "daily_limit": entry[4],
+                                "used": entry[5],
+                                "remaining": entry[4] - entry[5] if entry[4] and entry[5] else None,
+                            })
+                    result["quota"] = quotas
+                except Exception as e:
+                    result["quota"] = []
+                    result["quota_error"] = str(e)[:80]
+                
+                # ── Gems summary ──
+                try:
+                    await client.fetch_gems()
+                    result["gem_count"] = len(client.gems)
+                    if args.list_gems:
+                        result["gems"] = [{"id": gid, "name": g.name} 
+                                          for gid, g in list(client.gems.items())[:args.limit]]
+                except Exception:
+                    result["gem_count"] = -1
+                
+                print(json.dumps(result, ensure_ascii=False))
+            except Exception as e:
+                fail("ACCOUNT_STATUS_FAILED", str(e))
+            return
+
+        # ── Standalone: --setup-search-gem ──
+        if args.setup_search_gem:
+            sid, ts = resolve_auth(preferred_browser=args.browser or os.getenv("GEMINI_BROWSER"))
+            try:
+                client = GeminiClient(secure_1psid=sid, secure_1psidts=ts)
+                await client.init()
+                if SEARCH_GEM_PROMPT.exists():
+                    sys_prompt = SEARCH_GEM_PROMPT.read_text().strip()
+                else:
+                    sys_prompt = "You are a search grounding assistant. Return results as compact JSON."
+                gem = await client.create_gem(name=SEARCH_GEM_NAME, prompt=sys_prompt,
+                                               description=SEARCH_GEM_DESC)
+                print(json.dumps({"ok": True, "action": "setup-search-gem",
+                                  "id": gem.id, "name": gem.name}))
+            except Exception as e:
+                fail("SETUP_FAILED", str(e))
+            return
+
+        # ── Standalone: --create-gem ──
+        if args.create_gem_name:
+            if args.prompt_flag:
+                sys_prompt = args.prompt_flag
+                if not sys.stdin.isatty():
+                    stdin_content = sys.stdin.read().strip()
+                    if stdin_content:
+                        sys_prompt = f"{sys_prompt}\n\n{stdin_content}"
+            elif args.edit_sys_instr:
+                sys_prompt = args.edit_sys_instr
+            elif args.prompt:
+                sys_prompt = " ".join(args.prompt)
+            elif not sys.stdin.isatty():
+                sys_prompt = sys.stdin.read().strip()
+            else:
+                fail("NO_PROMPT", "Provide system prompt via -p, -S, stdin, or positional args.")
+            sid, ts = resolve_auth(preferred_browser=args.browser or os.getenv("GEMINI_BROWSER"))
+            gem_id_out = None
+            try:
+                try:
+                    client = GeminiClient(secure_1psid=sid, secure_1psidts=ts)
+                    await client.init()
+                    gem = await client.create_gem(
+                        name=args.create_gem_name, prompt=sys_prompt,
+                        description=f"Hermes task-specific Gem: {args.create_gem_name}")
+                    gem_id_out = gem.id
+                except Exception as lib_err:
+                    # Fallback: browser-shaped RPC (lib headers get e,4 rejections)
+                    rpc = await BrowserBatchRPC(sid, ts).init()
+                    try:
+                        payload = json.dumps([[args.create_gem_name,
+                            f"Hermes task-specific Gem: {args.create_gem_name}",
+                            sys_prompt, None, None, None, None, None, 0, None, 1,
+                            None, None, None, []]])
+                        text = await rpc.rpc("oMH3Zd", payload)
+                        pl = _extract_rpc_payloads(text, "oMH3Zd")
+                        gem_id_out = pl[0][0] if pl and pl[0] else None
+                        if not gem_id_out:
+                            raise RuntimeError(f"no gem id in response ({lib_err})")
+                    finally:
+                        await rpc.close()
+                print(json.dumps({"ok": True, "action": "create-gem",
+                                  "id": gem_id_out, "name": args.create_gem_name}))
+            except Exception as e:
+                fail("GEM_CREATE_FAILED", str(e))
+            return
+
+        # ── Standalone: --edit-gem ──
+        if args.edit_gem_id:
+            sid, ts = resolve_auth(preferred_browser=args.browser or os.getenv("GEMINI_BROWSER"))
+            try:
+                client = GeminiClient(secure_1psid=sid, secure_1psidts=ts)
+                await client.init()
+                await client.fetch_gems()
+                g = client.gems.get(args.edit_gem_id)
+                if not g:
+                    for gid, gg in client.gems.items():
+                        if gg.name.lower() == args.edit_gem_id.lower():
+                            g = gg; break
+                if not g:
+                    fail("GEM_NOT_FOUND", f"Gem '{args.edit_gem_id}' not found. Use --list-gems.")
+                new_name = args.edit_new_name or g.name
+                new_desc = args.edit_new_desc if args.edit_new_desc is not None else (g.description or "")
+                new_instr = args.edit_sys_instr if args.edit_sys_instr else None
+                await client.update_gem(gem=g, name=new_name, description=new_desc,
+                                      prompt=new_instr)
+                print(json.dumps({"ok": True, "action": "edit-gem",
+                                  "id": g.id, "name": new_name}))
+            except Exception as e:
+                fail("GEM_EDIT_FAILED", str(e))
+            return
+
+        # ── Standalone: --delete-gem ──
+        if args.delete_gem_id:
+            sid, ts = resolve_auth(preferred_browser=args.browser or os.getenv("GEMINI_BROWSER"))
+            try:
+                try:
+                    client = GeminiClient(secure_1psid=sid, secure_1psidts=ts)
+                    await client.init()
+                    await client.delete_gem(args.delete_gem_id)
+                except Exception:
+                    # Fallback: browser-shaped RPC DELETE_BOT UXcSJb
+                    rpc = await BrowserBatchRPC(sid, ts).init()
+                    try:
+                        await rpc.rpc("UXcSJb", json.dumps([args.delete_gem_id, [0, None, 0]]))
+                    finally:
+                        await rpc.close()
+                print(json.dumps({"ok": True, "action": "delete-gem", "id": args.delete_gem_id}))
+            except Exception as e:
+                fail("GEM_DELETE_FAILED", str(e))
+            return
+
+        # ── Standalone: --clear ──
+        if args.clear_conv:
+            if not args.conversation:
+                fail("NO_CONV", "Use --clear with -c <file>.")
+            fp = Path(args.conversation)
+            existed = fp.exists()
+            if existed: fp.unlink()
+            print(json.dumps({"ok": True, "action": "clear", "file": str(fp),
+                              "was_present": existed}))
+            return
+
+        # ── Standalone: --list-chats ──
+        if args.list_chats:
+            sid, ts = resolve_auth(preferred_browser=args.browser or os.getenv("GEMINI_BROWSER"))
+            try:
+                # gemini_webapi list_chats returns empty (missing headers); use browser-shaped RPC
+                rpc = await BrowserBatchRPC(sid, ts).init()
+                try:
+                    text = await rpc.rpc("MaZiqc", [args.limit, None, [0, None, 1]])
+                    payloads = _extract_rpc_payloads(text, "MaZiqc")
+                    chats = []
+                    for pb in payloads:
+                        # shape: [null, "<pageToken>", [[cid, title, ...], ...]] — chats at pb[2]
+                        if not (isinstance(pb, list) and len(pb) > 2 and isinstance(pb[2], list)):
+                            continue
+                        for cd in pb[2]:
+                            if isinstance(cd, list) and cd and isinstance(cd[0], str) and cd[0].startswith("c_"):
+                                cid, title = cd[0], (cd[1] if isinstance(cd[1], str) else "") or ""
+                                if not any(x["cid"] == cid for x in chats):
+                                    chats.append({"cid": cid, "title": title})
+                    print(json.dumps({"ok": True, "chats": chats[:args.limit], "total": len(chats)}))
+                finally:
+                    await rpc.close()
+            except Exception as e:
+                fail("LIST_CHATS_FAILED", str(e))
+            return
+
+        # ── Standalone: --read-chat ──
+        if args.read_chat_id:
+            sid, ts = resolve_auth(preferred_browser=args.browser or os.getenv("GEMINI_BROWSER"))
+            try:
+                # lib read_chat first; on failure fall back to browser-shaped hNvQHb RPC
+                try:
+                    client = GeminiClient(secure_1psid=sid, secure_1psidts=ts)
+                    await client.init()
+                    history = await client.read_chat(args.read_chat_id, limit=args.limit)
+                    if history and history.turns:
+                        turns = [{"role": t.role, "text": t.text} for t in history.turns]
+                        print(json.dumps({"ok": True, "chat": {
+                            "cid": history.cid, "turns": turns, "total": len(turns)}}, ensure_ascii=False))
+                        return
+                    raise RuntimeError("lib read_chat empty — falling back")
+                except (SystemExit,):
+                    raise
+                except Exception:
+                    pass
+                rpc = await BrowserBatchRPC(sid, ts).init()
+                try:
+                    text = await rpc.rpc("hNvQHb", [args.read_chat_id, args.limit, None, 1, [1], [4], None, 1])
+                    payloads = _extract_rpc_payloads(text, "hNvQHb")
+                    turns = []
+                    for pb in payloads:
+                        for conv_turn in (pb[0] if pb and isinstance(pb[0], list) else []):
+                            if not isinstance(conv_turn, list): continue
+                            user_text = ""
+                            try: user_text = conv_turn[2][0][0] or ""
+                            except Exception: pass
+                            model_text = ""
+                            try: model_text = conv_turn[3][0][0][1][0] or ""
+                            except Exception: pass
+                            if user_text: turns.append({"role": "user", "text": user_text})
+                            if model_text: turns.append({"role": "model", "text": model_text[:4000]})
+                    if turns:
+                        print(json.dumps({"ok": True, "chat": {"cid": args.read_chat_id, "turns": len(turns)}}))
+                        for t in turns:
+                            print(json.dumps(t, ensure_ascii=False))
+                    else:
+                        fail("CHAT_NOT_FOUND", f"Chat {args.read_chat_id} not found or empty.")
+                finally:
+                    await rpc.close()
+            except Exception as e:
+                fail("READ_CHAT_FAILED", str(e))
+            return
+
+        # ── Standalone: --delete-chat ──
+        if args.delete_chat_id:
+            sid, ts = resolve_auth(preferred_browser=args.browser or os.getenv("GEMINI_BROWSER"))
+            try:
+                client = GeminiClient(secure_1psid=sid, secure_1psidts=ts)
+                await client.init()
+                await client.delete_chat(args.delete_chat_id)
+                print(json.dumps({"ok": True, "action": "delete-chat", "cid": args.delete_chat_id}))
+            except Exception as e:
+                fail("DELETE_CHAT_FAILED", str(e))
+            return
+
+        # ── Standalone: --fetch-latest ──
+        if args.fetch_latest_id:
+            sid, ts = resolve_auth(preferred_browser=args.browser or os.getenv("GEMINI_BROWSER"))
+            try:
+                client = GeminiClient(secure_1psid=sid, secure_1psidts=ts)
+                await client.init()
+                out = await client.fetch_latest_chat_response(args.fetch_latest_id)
+                if out:
+                    data = {"ok": True, "cid": args.fetch_latest_id, "text": out.text}
+                    if out.thoughts: data["thoughts"] = out.thoughts
+                    imgs = [{"url": i.url, "alt": i.alt or ""} for i in (out.images or [])]
+                    if imgs: data["images"] = imgs
+                    vids = [{"url": v.url, "title": v.title or ""} for v in (out.videos or [])]
+                    if vids: data["videos"] = vids
+                    print(json.dumps(data, ensure_ascii=False))
+                else:
+                    fail("FETCH_LATEST_FAILED", f"No response for {args.fetch_latest_id}")
+            except Exception as e:
+                fail("FETCH_LATEST_FAILED", str(e))
+            return
+
+        # ── Standalone: --deep-research-status ──
+        if args.deep_research_status_id:
+            sid, ts = resolve_auth(preferred_browser=args.browser or os.getenv("GEMINI_BROWSER"))
+            try:
+                client = GeminiClient(secure_1psid=sid, secure_1psidts=ts)
+                await client.init()
+                st = await client.get_deep_research_status(args.deep_research_status_id)
+                if st:
+                    print(json.dumps({"ok": True, "status": st.model_dump() if hasattr(st, "model_dump") else str(st)}, ensure_ascii=False, default=str))
+                else:
+                    fail("RESEARCH_STATUS_FAILED", f"No status for {args.deep_research_status_id}")
+            except Exception as e:
+                fail("RESEARCH_STATUS_FAILED", str(e))
+            return
+
+        # ── Resolve URL / Gem ID ──
+        standalone = args.list_models or args.list_gems
+        if standalone and not args.url:
+            args.url = "setup"
+
+        # If no Gem URL given but positional words exist, they are the prompt, not a URL.
+        # (parse_intermixed_args dumps all positionals into args.url first.)
+        if not args.gem_id and args.url and args.prompt:
+            pass  # url + separate prompt words — keep as-is
+        elif not args.gem_id and args.url and not args.prompt_flag \
+                and not (args.url.startswith(("http://", "https://"))
+                         or re.fullmatch(r"[A-Za-z0-9_-]{5,20}", args.url or "")):
+            # multi-word or sentence-like positional = prompt text
+            args.prompt = args.url.split() + list(args.prompt)
+            args.url = None
+
+        if args.gem_id:
+            gem_id = args.gem_id
+        elif args.list_models or args.list_gems or args.list_chats:
+            gem_id = "dummy"
+        elif args.url:
+            try: gem_id = extract_gem_id(args.url)
+            except ValueError as e: fail("BAD_URL", str(e))
+        else:
+            gem_id = None  # direct chat, no Gem required
+
+        # ── Build prompt ──
+        if args.image_prompt:
+            prompt = f"Generate an image: {args.image_prompt}"
+            args.image_gen = True
+        elif args.prompt_flag:
+            prompt = args.prompt_flag
+            if not sys.stdin.isatty():
+                stdin_content = sys.stdin.read().strip()
+                if stdin_content:
+                    prompt = f"{prompt}\n\n{stdin_content}"
+        elif args.prompt:
+            prompt = " ".join(args.prompt)
+        elif args.list_models or args.list_gems or args.gem_info:
+            prompt = ""
+        elif not sys.stdin.isatty():
+            prompt = sys.stdin.read().strip()
+            if not prompt: fail("NO_PROMPT", "No prompt provided.")
+        elif args.image_gen:
+            prompt = "Generate an image."
+        else:
+            fail("NO_PROMPT", "No prompt. Use positional, -p, or stdin.")
+
+        if args.brief and prompt and not prompt.lower().startswith("be concise"):
+            prompt = "Be concise. " + prompt
+
+        # ── Handle --gem-info ──
+        if args.gem_info:
+            if not gem_id:
+                fail("GEM_REQUIRED", "A Gem URL, ID, or -g <id> is required for --gem-info.")
+            sid, ts = resolve_auth(preferred_browser=args.browser or os.getenv("GEMINI_BROWSER"))
+            try:
+                client = GeminiClient(secure_1psid=sid, secure_1psidts=ts)
+                await client.init()
+                await client.fetch_gems()
+                g = client.gems.get(gem_id)
+                if g:
+                    print(json.dumps({"ok": True, "gem": {
+                        "id": gem_id, "name": g.name, "description": g.description or "",
+                        "type": "system" if g.predefined else "user"}}))
+                else:
+                    print(json.dumps({"ok": True, "gem": {"id": gem_id, "name": "",
+                        "description": "", "type": "external", "note": "Shared Gem — not in library"}}))
+            except Exception as e:
+                fail("GEM_INFO_FAILED", str(e))
+            return
+
+        # ── Auth ──
+        sid, ts = resolve_auth(
+            preferred_browser=args.browser or os.getenv("GEMINI_BROWSER"),
+            allow_login=args.login)
+
+        # ── Init client ──
+        try:
+            self.client = GeminiClient(secure_1psid=sid, secure_1psidts=ts)
+            await self.client.init()
+        except Exception as e:
+            fail("INIT_FAILED", str(e))
+
+        # ── Discovery ──
+        if args.list_models:
+            try:
+                models = self.client.list_models()
+                print(json.dumps({"ok": True, "models": [str(m) for m in models]}))
+            except Exception as e: fail("LIST_FAILED", str(e))
+            return
+
+        if args.list_gems:
+            try:
+                await self.client.fetch_gems()
+                gems = [{"id": gid, "name": g.name, "description": g.description or "",
+                         "type": "system" if g.predefined else "user"}
+                        for gid, g in self.client.gems.items()]
+                print(json.dumps({"ok": True, "gems": gems}))
+            except Exception as e: fail("LIST_FAILED", str(e))
+            return
+
+        # ── Model ──
+        model = None
+        if args.model or args.thinking:
+            model = resolve_model_enum(args.model, args.thinking) if args.thinking \
+                    else resolve_model_string(self.client, args.model)
+
+        # ── Gem name ──
+        gem_name = ""
+        if gem_id and gem_id != "dummy":
+            try:
+                await self.client.fetch_gems()
+                g = self.client.gems.get(gem_id)
+                if g: gem_name = g.name
+            except Exception: pass
+
+        if not self.raw_mode:
+            model_label = friendly_model_label(model)
+            parts = []
+            if gem_name:
+                parts.append(f"gem={gem_name}")
+            elif gem_id and gem_id != "dummy":
+                parts.append(f"gem={gem_id}")
+            parts.append(f"model={model_label}")
+            if args.deep_research: parts.append("deep-research")
+            if args.image_gen: parts.append("img-gen")
+            if args.conversation: parts.append("multi-turn")
+            self.log(", ".join(parts))
+
+        # ── Conversation ──
+        conv_state = None; chat_metadata = None
+        if args.resume_session:
+            conv_state = {"cid": args.resume_session, "metadata": [args.resume_session, ""],
+                          "turns": 0, "created": datetime.now(timezone.utc).isoformat()}
+            chat_metadata = conv_state["metadata"]
+            self.log(f"Resuming session {args.resume_session}")
+        elif args.conversation:
+            if not args.new_conv:
+                conv_state = load_conv(args.conversation)
+                if conv_state: chat_metadata = conv_state.get("metadata")
+            if conv_state is None:
+                conv_state = {"cid": None, "metadata": None, "turns": 0,
+                              "created": datetime.now(timezone.utc).isoformat()}
+
+        # ── Image gen force flash ──
+        if args.image_gen and not model:
+            model = "gemini-3-flash"
+
+        # ── Files ──
+        all_files = []
+        for img in args.images:
+            if not Path(img).exists(): fail("FILE_NOT_FOUND", f"Image not found: {img}")
+            all_files.append(str(Path(img)))
+        for f in args.files:
+            if not Path(f).exists(): fail("FILE_NOT_FOUND", f"File not found: {f}")
+            all_files.append(str(Path(f)))
+
+        model_label = friendly_model_label(model)
+
+        # ── Deep research timeout ──
+        actual_timeout = args.timeout
+        if args.deep_research and args.timeout == 120:
+            actual_timeout = 600
+            self.log(f"Deep research: timeout auto-extended to {actual_timeout}s")
+
+        # ── Generate with retry ──
+        max_attempts = 1 if args.no_retry else 3
+        for attempt in range(max_attempts):
+            if attempt > 0: self.log(f"Retry {attempt+1}/{max_attempts}...")
+            try:
+                if args.deep_research:
+                    self.log("Creating research plan...")
+                    try:
+                        # Try high-level deep_research first (handles plan+start+wait internally)
+                        self.log("Starting deep research...")
+                        result = await asyncio.wait_for(
+                            self.client.deep_research(
+                                prompt, poll_interval=15.0, timeout=actual_timeout,
+                                on_status=lambda s: (self.log(f"  [{s.state or '...'}]")
+                                                      if not self.raw_mode and s else None)),
+                            timeout=actual_timeout)
+                        response = result.final_output
+                    except Exception as plan_err:
+                        plan_msg = str(plan_err)
+                        if "not eligible" in plan_msg.lower() or "rejected" in plan_msg.lower():
+                            fail("DEEP_RESEARCH_REJECTED",
+                                 f"Account not eligible for deep research. {plan_msg}",
+                                 {"retry": False})
+                        # Fallback: manual plan-based flow
+                        self.log(f"High-level DR failed, trying manual plan: {plan_msg}")
+                        try:
+                            plan = await asyncio.wait_for(
+                                self.client.create_deep_research_plan(prompt, model=model), timeout=120)
+                            self.log(f"Plan: {plan.title or 'Research'} — starting...")
+                            await asyncio.wait_for(
+                                self.client.start_deep_research(
+                                    plan, confirm_prompt="Proceed with this plan without modifications."),
+                                timeout=120)
+                            self.log("Research in progress...")
+                            result = await asyncio.wait_for(
+                                self.client.wait_for_deep_research(
+                                    plan, poll_interval=15.0, timeout=actual_timeout,
+                                    on_status=lambda s: (self.log(f"  [{s.state or '...'}]")
+                                                          if not self.raw_mode and s else None)),
+                                timeout=actual_timeout)
+                            response = result.final_output
+                        except Exception as manual_err:
+                            # Last resort: generate_content with deep_research=True
+                            self.log(f"Manual plan failed, trying direct mode: {manual_err}")
+                            kwargs = {"prompt": prompt, "deep_research": True}
+                            if model: kwargs["model"] = model
+                            response = await asyncio.wait_for(
+                                self.client.generate_content(**kwargs), timeout=actual_timeout)
+                else:
+                    kwargs = {"prompt": prompt}
+                    if all_files: kwargs["files"] = all_files
+                    if chat_metadata: kwargs["chat"] = ChatRef(chat_metadata)
+                    if model: kwargs["model"] = model
+                    if gem_id and gem_id != "dummy":
+                        kwargs["gem"] = gem_id
+                    if args.temporary:
+                        kwargs["temporary"] = True
+                    if args.stream:
+                        # Streaming mode — print only new tokens as they arrive
+                        full_text = []
+                        if not self.raw_mode:
+                            sys.stderr.write("[streaming] ")
+                            sys.stderr.flush()
+                        async for chunk in self.client.generate_content_stream(**kwargs):
+                            if hasattr(chunk, 'text') and chunk.text:
+                                text = chunk.text
+                                # Chunks are cumulative — only print new portion
+                                if full_text:
+                                    prev = full_text[-1]
+                                    if text.startswith(prev) and len(text) > len(prev):
+                                        new = text[len(prev):]
+                                        full_text.append(text)
+                                        if not self.raw_mode:
+                                            sys.stderr.write(new)
+                                            sys.stderr.flush()
+                                else:
+                                    full_text.append(text)
+                                    if not self.raw_mode:
+                                        sys.stderr.write(text)
+                                        sys.stderr.flush()
+                        if not self.raw_mode:
+                            sys.stderr.write("\n")
+                        # Use the last (most complete) chunk as response text
+                        final_text = full_text[-1] if full_text else ""
+                        class StreamResponse:
+                            def __init__(self, text):
+                                self.text = text
+                                self.images = []
+                                self.videos = []
+                                self.media = []
+                                self.thoughts = None
+                                self.metadata = None
+                        response = StreamResponse(final_text)
+                    else:
+                        response = await asyncio.wait_for(
+                            self.client.generate_content(**kwargs), timeout=actual_timeout)
+            except asyncio.TimeoutError:
+                if attempt == max_attempts - 1:
+                    # Playwright fallback
+                    if gem_id and gem_id != "dummy" and not os.environ.get("GEMCLI_NO_PW"):
+                        self.log("API timed out, trying browser fallback (gem-pw)...")
+                        pwj = self._pw_fallback(gem_id, prompt, args.output)
+                        if pwj:
+                            self.log(f"Browser fallback OK: {pwj.get('s',0)} chars")
+                            print(json.dumps(pwj)); return
+                    fail("TIMEOUT", f"Timed out after {actual_timeout}s.",
+                         {"timeout_s": actual_timeout, "retry": False})
+                continue
+            except Exception as e:
+                err_msg = str(e); kind = error_kind(err_msg)
+                if kind == "AUTH_EXPIRED":
+                    if attempt == max_attempts - 1: fail("AUTH_EXPIRED", err_msg)
+                    self.log("Auth expired, re-scanning...")
+                    new_sid, new_ts = refresh_auth(args.browser or os.getenv("GEMINI_BROWSER"))
+                    if not new_sid:
+                        # Fallback: pull straight from the auth cache if it differs
+                        c_sid, c_ts = _load_auth_cache()
+                        new_sid, new_ts = (c_sid, c_ts) if c_sid else (None, None)
+                    if new_sid:
+                        sid, ts = new_sid, new_ts
+                        self.client = GeminiClient(secure_1psid=sid, secure_1psidts=ts)
+                        await self.client.init()
+                        continue
+                if kind == "RATE_LIMIT":
+                    wait = 30 if attempt == 0 else 60
+                    if attempt == max_attempts - 1:
+                        fail("RATE_LIMIT", err_msg, {"retry_after_s": wait, "retry": True})
+                    self.log(f"Rate limited, waiting {wait}s...")
+                    await asyncio.sleep(wait); continue
+                if attempt == max_attempts - 1:
+                    if gem_id and gem_id != "dummy" and not os.environ.get("GEMCLI_NO_PW"):
+                        self.log("API failed, trying browser fallback (gem-pw)...")
+                        pwj = self._pw_fallback(gem_id, prompt, args.output)
+                        if pwj:
+                            self.log(f"Browser fallback OK: {pwj.get('s',0)} chars")
+                            print(json.dumps(pwj)); return
+                    fail(kind, err_msg)
+                continue
+
+            # Success
+            text = response.text
+            new_meta = list(response.metadata) if response.metadata else None
+
+            # Images / Videos / Media / Thoughts
+            images_out, videos_out, media_out = [], [], []
+            thoughts_text = None
+            try:
+                for img in response.images:
+                    images_out.append({"url": img.url, "alt": img.alt or ""})
+            except Exception: pass
+            try:
+                for v in response.videos:
+                    videos_out.append({"url": v.url, "title": getattr(v, 'title', '') or ""})
+            except Exception: pass
+            try:
+                for m in response.media:
+                    media_out.append({"url": m.url, "title": getattr(m, 'title', '') or ""})
+            except Exception: pass
+            try:
+                thoughts_text = response.thoughts
+            except Exception: pass
+            # include thoughts for thinking models even if --show-thoughts not set (stored in json)
+            has_thoughts = bool(thoughts_text)
+
+            # Save generated images to disk
+            if args.save_images and images_out:
+                import urllib.request as _ur
+                sd = Path(args.save_images)
+                sd.mkdir(parents=True, exist_ok=True)
+                saved = []
+                cookie_str = f"__Secure-1PSID={sid}; __Secure-1PSIDTS={ts}"
+                for i, img in enumerate(images_out):
+                    try:
+                        fp = sd / f"gemini_img_{i}.png"
+                        req = _ur.Request(img["url"], headers={"Cookie": cookie_str})
+                        with _ur.urlopen(req, timeout=30) as resp:
+                            fp.write_bytes(resp.read())
+                        saved.append(str(fp))
+                    except Exception as dl_err:
+                        self.log(f"Image {i} download failed: {dl_err}")
+                if saved:
+                    self.log(f"Saved {len(saved)} image(s) to {sd}")
+
+            # Save generated videos to disk
+            if args.save_videos:
+                if videos_out:
+                    import urllib.request as _ur
+                    sd = Path(args.save_videos)
+                    sd.mkdir(parents=True, exist_ok=True)
+                    saved = []
+                    cookie_str = f"__Secure-1PSID={sid}; __Secure-1PSIDTS={ts}"
+                    for i, v in enumerate(videos_out):
+                        try:
+                            fp = sd / f"gemini_video_{i}.mp4"
+                            req = _ur.Request(v["url"], headers={"Cookie": cookie_str})
+                            with _ur.urlopen(req, timeout=60) as resp:
+                                data = resp.read()
+                                # handle 206 polling placeholder (webapi GeneratedVideo retries)
+                                if len(data) < 100 and b"206" in data[:10]:
+                                    self.log(f"Video {i} still generating (206), skipping")
+                                    continue
+                                fp.write_bytes(data)
+                            saved.append(str(fp))
+                        except Exception as dl_err:
+                            self.log(f"Video {i} download failed: {dl_err}")
+                    if saved:
+                        self.log(f"Saved {len(saved)} video(s) to {sd}")
+                else:
+                    self.log("No videos in response — Veo quota may be limited (3/day Pro, 5/day Ultra) or prompt didn't trigger video. Try --img for images.")
+
+            # Save generated media (audio/video) to disk
+            if args.save_media:
+                if media_out:
+                    import urllib.request as _ur
+                    sd = Path(args.save_media)
+                    sd.mkdir(parents=True, exist_ok=True)
+                    saved = []
+                    cookie_str = f"__Secure-1PSID={sid}; __Secure-1PSIDTS={ts}"
+                    for i, m in enumerate(media_out):
+                        try:
+                            fp = sd / f"gemini_media_{i}.mp4"
+                            req = _ur.Request(m["url"], headers={"Cookie": cookie_str})
+                            with _ur.urlopen(req, timeout=60) as resp:
+                                fp.write_bytes(resp.read())
+                            saved.append(str(fp))
+                        except Exception as dl_err:
+                            self.log(f"Media {i} download failed: {dl_err}")
+                    if saved:
+                        self.log(f"Saved {len(saved)} media file(s) to {sd}")
+                else:
+                    self.log("No media in response — try --save-videos for Veo or --save-images for Imagen.")
+
+            # Update conversation (skip if temporary)
+            if args.temporary:
+                self.log("Temporary chat — not saving to history")
+            elif args.conversation and new_meta:
+                conv_state["cid"] = new_meta[0]
+                conv_state["metadata"] = new_meta
+                conv_state["turns"] += 1
+                save_conv(args.conversation, conv_state)
+
+            # Output file
+            ext = ".json" if args.json_out else ".md"
+            out_path = Path(args.output) if args.output else \
+                       Path(f"/tmp/gemini-{datetime.now().strftime('%Y%m%d-%H%M%S')}{ext}")
+
+            if args.json_out:
+                payload = {"ok": True, "text": text, "model": model_label}
+                if images_out: payload["images"] = images_out
+                if videos_out: payload["videos"] = videos_out
+                if media_out: payload["media"] = media_out
+                if has_thoughts: payload["thoughts"] = thoughts_text
+                else:
+                    if args.show_thoughts:
+                        self.log("No thoughts returned — model may not provide thinking traces for this prompt/tier (deep research often does).")
+                if args.temporary: payload["temporary"] = True
+                if conv_state: payload["conversation"] = conv_state
+                out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            else:
+                out_text = text
+                if has_thoughts and args.show_thoughts:
+                    out_text += "\n\n## Thoughts\n\n" + thoughts_text
+                elif args.show_thoughts and not has_thoughts:
+                    self.log("No thoughts returned — model may not provide thinking traces for this prompt/tier (deep research often does).")
+                if images_out:
+                    out_text += "\n\n## Images\n\n"
+                    for i, img in enumerate(images_out):
+                        out_text += f"{i+1}. ![{img['alt']}]({img['url']})\n"
+                if videos_out:
+                    out_text += "\n\n## Videos\n\n"
+                    for i, v in enumerate(videos_out):
+                        out_text += f"{i+1}. [Video {v['title']}]({v['url']})\n"
+                if media_out:
+                    out_text += "\n\n## Media\n\n"
+                    for i, m in enumerate(media_out):
+                        out_text += f"{i+1}. [Media]({m['url']})\n"
+                out_path.write_text(out_text, encoding="utf-8")
+
+            # Extract Canvas artifact if requested
+            if args.extract_canvas:
+                try:
+                    canvas_blocks = [cb for cb in self.parse_code_blocks(text) if cb["lang"] in ("html","xml","svg","canvas")]
+                    # fallback: if text contains <!DOCTYPE or <html, dump whole text
+                    canvas_content = None
+                    if canvas_blocks:
+                        canvas_content = canvas_blocks[0]["code"]
+                    elif "<html" in text.lower() or "<!doctype" in text.lower():
+                        canvas_content = text
+                    if canvas_content:
+                        Path(args.extract_canvas).write_text(canvas_content, encoding="utf-8")
+                        self.log(f"Canvas artifact saved to {args.extract_canvas}")
+                    else:
+                        self.log("No Canvas/HTML block found for --extract-canvas")
+                except Exception as ce:
+                    self.log(f"Canvas extract failed: {ce}")
+
+            code_blocks = self.parse_code_blocks(text)
+
+            if args.extract_code:
+                n = args.extract_code
+                if n < 1 or n > len(code_blocks):
+                    fail("BAD_CODE_INDEX", f"Block {n} not found ({len(code_blocks)} blocks).")
+                cb = code_blocks[n - 1]
+                if args.output:
+                    Path(args.output).write_text(cb["code"], encoding="utf-8")
+                    print(json.dumps({"ok": True, "action": "extract-code", "n": n,
+                                      "lang": cb["lang"], "f": args.output}))
+                else:
+                    print(cb["code"])
+                return
+
+            self.pointer(out_path, conv_state if args.conversation and not args.temporary else None,
+                         images_out, videos_out, media_out, len(code_blocks), has_thoughts,
+                         model_label, gem_name, args.deep_research, args.temporary)
+            return
+
+# ── Entry point ──────────────────────────────────────────────
+
+def main():
+    asyncio.run(GeminiCLI().run())
+
+if __name__ == "__main__":
+    main()

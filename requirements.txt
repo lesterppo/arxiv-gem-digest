@@ -1,0 +1,6 @@
+# arxiv-gem-digest runtime deps (installed in GitHub Actions runner)
+# gemini.py uses gemini-webapi (cookie auth) + curl_cffi; stdlib elsewhere.
+gemini-webapi>=2.0.0
+curl_cffi>=0.7.0
+loguru
+browser-cookie3>=2.0.0
