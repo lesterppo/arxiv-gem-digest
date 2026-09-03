@@ -6,3 +6,4 @@ curl_cffi>=0.7.0
 loguru
 browser-cookie3
 matplotlib>=3.8
+notebooklm-py>=0.8.1
