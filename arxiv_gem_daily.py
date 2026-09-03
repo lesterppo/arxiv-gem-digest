@@ -302,32 +302,59 @@ def send_email(subject: str, html_body: str) -> None:
 
 
 def md_to_htmlish(text: str) -> str:
-    """Light markdown -> html (headings, bold, bullet lines, links). Acceptable
-    for email. Preserves content; arrows/em-dashes safe in UTF-8."""
+    """Markdown -> email-safe HTML: headings (#..####), **bold**, *italic*,
+    `code`, bullets (- and *), bare arXiv ids linkified. Escapes HTML first."""
     esc = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    def _inline(s: str) -> str:
+        # arXiv ids: bare '2609.02885' first (creates anchors), then the
+        # 'arxiv:ID' / 'arxiv ID' prefix form — running prefix-form first
+        # leaves the bare id inside the generated href, which the bare pass
+        # would then wrap again (nested <a>).
+        s = re.sub(r"(?<![\d/.])(\d{4}\.\d{4,5})(?![\d/.])",
+                   r'<a href="https://arxiv.org/abs/\1">\1</a>', s)
+        s = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", s)      # bold
+        s = re.sub(r"(?<!\*)\*([^*\s][^*]*)\*(?!\*)", r"<i>\1</i>", s)  # italic
+        s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)      # code
+        s = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r'<a href="\2">\1</a>', s)
+        return s
+
     lines = []
+    in_ul = False
     for raw in esc.splitlines():
         line = raw.rstrip()
-        if not line.strip():
+        stripped = line.strip()
+        if not stripped:
+            if in_ul:
+                lines.append("</ul>")
+                in_ul = False
             lines.append("<br/>")
             continue
-        # linkify arXiv ids
-        line = re.sub(r"arxiv[: ]+(\d{4}\.\d{4,5})",
-                      r'<a href="https://arxiv.org/abs/\1">\1</a>', line)
-        # headings: map #/## -> h3, ### -> h4 (email-safe scale)
-        m = re.match(r"^(#{1,3})\s+(.*)", line)
+        # headings: #/## -> h3, ###/#### -> h4
+        m = re.match(r"^(#{1,4})\s+(.*)", stripped)
         if m:
-            depth = len(m.group(1))
-            tag = "h3" if depth <= 2 else "h4"
-            lines.append(f"<{tag}>{m.group(2)}</{tag}>")
+            if in_ul:
+                lines.append("</ul>")
+                in_ul = False
+            tag = "h3" if len(m.group(1)) <= 2 else "h4"
+            lines.append(f"<{tag}>{_inline(m.group(2))}</{tag}>")
             continue
-        if line.lstrip().startswith("- "):
-            lines.append(f"<li>{line.lstrip()[2:]}</li>")
+        # bullets: '- ' or '* '
+        m = re.match(r"^[-*]\s+(.*)", stripped)
+        if m:
+            if not in_ul:
+                lines.append("<ul>")
+                in_ul = True
+            lines.append(f"<li>{_inline(m.group(1))}</li>")
             continue
-        lines.append(line)
-    body = "<br/>".join(lines)
-    body = body.replace("<li><br/>", "<li>")
-    return body
+        if in_ul:
+            lines.append("</ul>")
+            in_ul = False
+        # table-ish score lines and plain text
+        lines.append(_inline(stripped))
+    if in_ul:
+        lines.append("</ul>")
+    return "<br/>".join(lines)
 
 
 def render_email_digest(date_label: str, gemini_text: str) -> str:
