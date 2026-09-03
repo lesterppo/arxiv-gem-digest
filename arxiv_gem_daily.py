@@ -204,13 +204,16 @@ def _build_prompt(candidates: list[dict]) -> str:
         f"Below are {len(candidates)} recent {CATEGORY} arXiv papers "
         "(title + author + abstract snippet + arXiv id).",
         "",
-        "For EVERY paper output one short scored line:",
-        "  - 'AGENT' score 1-5  (applicability to local AI-agent harness work; 5 = directly reusable method/idea)",
-        "  - 'TUNE'  score 1-5  (applicability to small-model fine-tune/training on free Colab T4; 5 = practical/implementable there)",
-        "  Do NOT give both 0/low unless truly irrelevant.",
+        "For EVERY paper output one short scored line in EXACTLY this format "
+        "(keep the title SHORT — it must appear on the line so the reader can "
+        "judge relevance without clicking):",
+        "  arXiv-ID — Short title — AGENT n/5 — TUNE n/5",
+        "  - 'AGENT' 1-5: applicability to local AI-agent harness work (5 = directly reusable method/idea)",
+        "  - 'TUNE'  1-5: applicability to small-model fine-tune/training on free Colab T4 (5 = practical/implementable there)",
+        "  Do NOT give both low unless truly irrelevant.",
         "",
-        "Then write a 'RECOMMENDED' section: for papers scoring >=4 in AGENT or >=4 in TUNE, "
-        "give a 1-3 sentence plain-English summary (what it does, the key idea), "
+        "Then a 'RECOMMENDED' section, papers with AGENT >=4 OR TUNE >=4, best first. "
+        "For each: a 1-3 sentence plain-English summary (what it does, the key idea), "
         "WHY it matters for (A)/(B), and a concrete takeaway or minimal experiment "
         "idea an engineer could try with local tools / a T4.",
         "",
