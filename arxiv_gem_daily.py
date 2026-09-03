@@ -441,10 +441,7 @@ def main() -> int:
     log(f"Gemini digest produced {len(text)} chars")
 
     # 5. Compose + email
-    header = []
-    # dedup / skip detail is emailed in the meta
-    digest_md = text
-    html = render_email_digest(date_label, digest_md)
+    html = render_email_digest(date_label, text)
     subject = f"[arXiv cs.AI digest] {now.strftime('%Y-%m-%d')} — {len(candidates)} new papers"
     send_email(subject, html)
 
