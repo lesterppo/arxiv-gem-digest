@@ -524,10 +524,11 @@ def main() -> int:
                 papers_ctx = infographic.parse_score_lines(score_lines)
                 nb_title = f"arXiv cs.AI Daily Digest — {now.strftime('%Y-%m-%d')}"
                 nb = infographic.nlm_ensure_notebook(nb_title)
-                n = infographic.nlm_add_text_sources(
-                    nb, infographic.nlm_arxiv_sources(papers_ctx[:6]))
-                log(f"NotebookLM: notebook {nb}, {n} sources")
                 rec_text = text[text.find("RECOMMENDED"):] if "RECOMMENDED" in text else ""
+                n = infographic.nlm_add_text_sources(
+                    nb, infographic.nlm_arxiv_sources(
+                        papers_ctx[:6], notes=rec_text))
+                log(f"NotebookLM: notebook {nb}, {n} sources")
                 inst = infographic.arxiv_notebook_context(papers_ctx[:6], rec_text[:1200])
                 url = infographic.nlm_generate_infographic(nb, inst)
                 if url:
