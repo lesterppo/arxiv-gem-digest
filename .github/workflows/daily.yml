@@ -80,3 +80,15 @@ jobs:
           else
             python3 arxiv_gem_daily.py
           fi
+
+      - name: Upload digest artifacts (QA)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arxiv-digest-output
+          path: |
+            ~/.hermes/digest_images/
+            /tmp/digest_*.html
+            /tmp/arxiv_digest_email.html
+          if-no-files-found: ignore
+          retention-days: 3

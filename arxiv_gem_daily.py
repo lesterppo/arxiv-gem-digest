@@ -296,6 +296,12 @@ def send_email(subject: str, html_body: str,
                image_paths: list[str] | str | None = None,
                cids: list[str] | None = None) -> None:
     """Send HTML email with optional inline CID images (chart, gemini banner)."""
+    try:
+        with open("/tmp/arxiv_digest_email.html", "w") as f:
+            f.write(html_body)
+    except Exception:
+        pass
+
     if isinstance(image_paths, str):
         image_paths = [image_paths]
     image_paths = image_paths or []
