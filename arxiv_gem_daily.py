@@ -428,6 +428,10 @@ def send_email(subject: str, html_body: str,
     except Exception:
         pass
 
+    if os.environ.get("DIGEST_DRY_RUN", "").lower() in ("1", "true", "yes"):
+        log(f"DRY RUN — email suppressed (would send: {subject})")
+        return
+
     if isinstance(image_paths, str):
         image_paths = [image_paths]
     image_paths = image_paths or []

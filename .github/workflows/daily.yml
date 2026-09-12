@@ -20,6 +20,11 @@ on:
         required: false
         default: ""
         type: string
+      dry_run:
+        description: "1 = exercise the pipeline but do NOT send the email"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -70,7 +75,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: state
-          key: arxiv-seen-v1
+          # Rolling key: a fixed key always HITS, and a hit skips the save,
+          # so the dedup state would stay frozen and every run would
+          # re-report the whole window. Unique key + prefix restore keeps the
+          # newest snapshot flowing to the next run.
+          key: arxiv-seen-${{ github.run_id }}
+          restore-keys: arxiv-seen-
 
       - name: Run arXiv Gemini digest
         env:
@@ -79,6 +89,7 @@ jobs:
           RECIPIENT: ${{ secrets.RECIPIENT }}
           NOTEBOOKLM_TRANSPORT: curl_cffi
           ARXIV_FETCH_SOURCE: ${{ github.event.inputs.fetch_source }}
+          DIGEST_DRY_RUN: ${{ github.event.inputs.dry_run }}
         run: |
           if [ -n "${{ github.event.inputs.back_days }}" ]; then
             RUN_BACK_DAYS="${{ github.event.inputs.back_days }}" \
