@@ -15,6 +15,11 @@ on:
         required: false
         default: ""
         type: string
+      fetch_source:
+        description: "auto (default) or rss — force the RSS fallback path (test)"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -73,6 +78,7 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           RECIPIENT: ${{ secrets.RECIPIENT }}
           NOTEBOOKLM_TRANSPORT: curl_cffi
+          ARXIV_FETCH_SOURCE: ${{ github.event.inputs.fetch_source }}
         run: |
           if [ -n "${{ github.event.inputs.back_days }}" ]; then
             RUN_BACK_DAYS="${{ github.event.inputs.back_days }}" \

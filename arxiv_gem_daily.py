@@ -589,38 +589,34 @@ def main() -> int:
     start_dt = now - timedelta(days=back)
     date_label = now.strftime("%Y-%m-%d %H:%M UTC")
 
-    # 1. Fetch (API first; RSS fallback when the API IP-rate-limits us)
-    source = "api"
-    try:
-        raw = fetch_papers(start_dt, now)
-        log(f"Fetched {len(raw)} raw entries [{start_dt.date()} .. {now.date()}]")
-    except Exception as e:  # noqa: BLE001
-        log(f"arXiv API fetch failed ({e}) — trying RSS fallback")
+    # 1. Fetch. API first (richer metadata, primary-category filter); RSS
+    #    second — a different arXiv service that survives the API's IP-level
+    #    429s and is announcement-fresh, which also covers the API index lag
+    #    (the API windows on *submission* time, arXiv announces 1-2 days
+    #    later). ARXIV_FETCH_SOURCE=rss flips the order (used to test the
+    #    fallback path on CI).
+    prefer_rss = os.environ.get("ARXIV_FETCH_SOURCE", "auto").lower() == "rss"
+    order = [("rss", fetch_papers_rss), ("api", fetch_papers)]
+    if not prefer_rss:
+        order.reverse()
+    sub = f"[{start_dt.date()} .. {now.date()}]"
+    raw, source, errs = [], "api", []
+    for name, fn in order:
         try:
-            raw = fetch_papers_rss(start_dt, now)
-            source = "rss"
-            log(f"Fetched {len(raw)} raw entries via RSS "
-                f"[{start_dt.date()} .. {now.date()}]")
-        except Exception as e2:  # noqa: BLE001
-            log(f"FATAL arXiv fetch failed (api: {e}; rss: {e2})")
-            traceback.print_exc()
-            send_email(f"[WARN] arXiv cs.AI digest — fetch failed {date_label}",
-                       f"<pre>arXiv API error: {e}\n\narXiv RSS error: {e2}\n\n"
-                       f"{traceback.format_exc()}</pre>")
-            return 2
-
-    if not raw:
-        # The API window is measured against *submission* time, but arXiv
-        # announces papers a day or two later and the API index lags; a
-        # 0-paper API window therefore doesn't mean "nothing new". The RSS
-        # feed is announcement-fresh — use it before declaring a quiet day.
-        log("arXiv API returned nothing inside the window — checking RSS")
-        try:
-            raw = fetch_papers_rss(start_dt, now)
-            source = "rss"
-            log(f"Fetched {len(raw)} raw entries via RSS")
+            raw = fn(start_dt, now)
+            source = name
+            log(f"Fetched {len(raw)} raw entries via {name} {sub}")
         except Exception as e:  # noqa: BLE001
-            log(f"RSS cross-check failed: {e}")
+            errs.append(f"{name}: {e}")
+            log(f"arXiv fetch via {name} failed ({e}) — trying next source")
+        if raw:
+            break
+
+    if not raw and len(errs) == len(order):
+        log("FATAL arXiv fetch failed on every source — " + "; ".join(errs))
+        send_email(f"[WARN] arXiv cs.AI digest — fetch failed {date_label}",
+                   f"<pre>{chr(10).join(errs)}\n\n{traceback.format_exc()}</pre>")
+        return 2
 
     if not raw:
         log("No entries in window — nothing to do.")
