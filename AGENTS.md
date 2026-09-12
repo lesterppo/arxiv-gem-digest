@@ -21,6 +21,15 @@ If you are an AI agent told to modify or operate this repo, read the
   500 on the plain cat query — the script instead pulls newest pages then
   filters locally by the Atom `published` date. Don't reintroduce a date-range
   search_query.
+- **Fetch resilience (two tiers)**: the API call runs a retry ladder
+  (429/5xx + transient socket errors, exponential backoff, honours
+  `Retry-After`) across two hosts (`export.arxiv.org` → `arxiv.org`). If the
+  API is still unusable — GitHub runners share egress IPs and get IP-level
+  429s — the run falls back to the arXiv **RSS feed**
+  (`rss.arxiv.org/rss/cs.AI`, a different service) and tags the email subject
+  `(RSS fallback)`. This also covers the API's index lag: the API windows on
+  *submission* time while arXiv announces 1-2 days later, so a 0-paper API
+  window triggers the same RSS cross-check instead of a silent "nothing new".
 - **States**: only `state/seen_ids.json` is stateful (gitignored); everything
   else is idempotent.
 - **Local dev run** uses `~/.gemini-cli/auth.json`; CI writes it from secrets.

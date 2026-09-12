@@ -31,6 +31,7 @@ import subprocess
 import sys
 import time
 import traceback
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -52,7 +53,13 @@ except ImportError:
 
 # ── Configuration ──────────────────────────────────────────────────────────
 
-ARXIV_API = "http://export.arxiv.org/api/query"
+ARXIV_API_HOSTS = ("export.arxiv.org", "arxiv.org")
+ARXIV_API_PATH = "/api/query"
+ARXIV_RSS = "https://rss.arxiv.org/rss/{cat}"
+ARXIV_PAGE_SLEEP = 3.0            # arXiv etiquette: >=3s between API calls
+ARXIV_HTTP_TRIES = 4              # retry ladder per URL (429/5xx/transient)
+ARXIV_UA = os.environ.get("ARXIV_UA") or (
+    "arxiv-gem-digest/1.0 (+https://github.com/lesterppo/arxiv-gem-digest)")
 CATEGORY = "cs.AI"
 QUERY_TERM = f'cat:{CATEGORY} AND submittedDate:[{{start}}T000000 TO {{end}}T235959]'
 
@@ -82,6 +89,69 @@ NS = {"a": "http://www.w3.org/2005/Atom",
       "arxiv": "http://arxiv.org/schemas/atom"}
 
 
+def _retry_after(err) -> float | None:
+    """Honour a server-supplied Retry-After (seconds form) when present."""
+    try:
+        ra = err.headers.get("Retry-After") if err.headers else None
+        if ra:
+            return max(1.0, min(60.0, float(str(ra).strip())))
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _http_get(url: str, timeout: int = 45, tries: int = ARXIV_HTTP_TRIES,
+              label: str = "arxiv") -> bytes:
+    """GET with a retry ladder. arXiv rate-limits by IP (HTTP 429) — GitHub
+    runners share egress IPs, so a single unlucky request must not kill the
+    whole digest run. Retries 429/5xx and transient socket errors with
+    exponential backoff, honouring Retry-After when the server sends it."""
+    last = None
+    for attempt in range(tries):
+        req = urllib.request.Request(url, headers={
+            "User-Agent": ARXIV_UA,
+            "Accept": "*/*",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:  # noqa: PERF203
+            last = e
+            if e.code not in (429, 500, 502, 503, 504) or attempt == tries - 1:
+                raise
+            wait = _retry_after(e) or min(60.0, 5.0 * (3 ** attempt))  # 5/15/45s
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            last = e
+            if attempt == tries - 1:
+                raise
+            wait = min(60.0, 4.0 * (2 ** attempt))  # 4/8/16s
+        log(f"{label}: transient failure ({last}) — retry "
+            f"{attempt + 1}/{tries - 1} in {wait:.0f}s")
+        time.sleep(wait)
+    raise RuntimeError(f"{label}: exhausted {tries} attempts ({last})")
+
+
+def _api_url(host: str, start_page: int) -> str:
+    return (f"https://{host}{ARXIV_API_PATH}?search_query=" +
+            urllib.parse.quote(f"cat:{CATEGORY}") +
+            f"&start={start_page}&max_results=200" +
+            "&sortBy=submittedDate&sortOrder=descending")
+
+
+def _api_page(start_page: int):
+    """One API page, trying each arXiv host before giving up."""
+    errs = []
+    for host in ARXIV_API_HOSTS:
+        try:
+            return ET.fromstring(
+                _http_get(_api_url(host, start_page),
+                          label=f"arxiv-api[{host}]"))
+        except Exception as e:  # noqa: BLE001
+            errs.append(f"{host}: {e}")
+            log(f"arXiv API host {host} failed: {e}")
+    raise RuntimeError("all arXiv API hosts failed — " + "; ".join(errs))
+
+
 def fetch_papers(start_dt: datetime, end_dt: datetime) -> list[dict]:
     """Fetch recent cs.AI papers via the arXiv API, newest-first, then filter
     to those actually published (submitted) within [start_dt, end_dt].
@@ -90,16 +160,17 @@ def fetch_papers(start_dt: datetime, end_dt: datetime) -> list[dict]:
     cat query (returns HTTP 500), so we pull `max_results` newest by date and
     drop anything older than the window. ~160-170 papers land per day on
     cs.AI, so max_results covers several days of submissions."""
-    query = f"cat:{CATEGORY}"
     papers = []
     start_page = 0
     while True:
-        url = (ARXIV_API + "?search_query=" + urllib.parse.quote(query) +
-               f"&start={start_page}&max_results=200" +
-               "&sortBy=submittedDate&sortOrder=descending")
-        req = urllib.request.Request(url, headers={"User-Agent": "arxiv-gem-digest/1.0"})
-        with urllib.request.urlopen(req, timeout=45) as resp:
-            root = ET.fromstring(resp.read())
+        try:
+            root = _api_page(start_page)
+        except Exception:
+            if start_page == 0:
+                raise  # nothing usable -> caller falls back to RSS
+            log(f"arXiv page {start_page} unavailable — using {len(papers)} "
+                "papers already collected")
+            break
         entries = root.findall("a:entry", NS)
         if not entries:
             break
@@ -132,7 +203,62 @@ def fetch_papers(start_dt: datetime, end_dt: datetime) -> list[dict]:
         start_page += 200
         if start_page >= 800:  # safety against pathological pagination
             break
+        time.sleep(ARXIV_PAGE_SLEEP)  # be polite between pages
     return papers
+
+
+def fetch_papers_rss(start_dt: datetime, end_dt: datetime) -> list[dict]:
+    """Fallback source: the arXiv RSS feed (rss.arxiv.org), which is a
+    different service from the API and keeps working when the API is
+    IP-rate-limited. Same output shape as fetch_papers()."""
+    raw = _http_get(ARXIV_RSS.format(cat=CATEGORY), label="arxiv-rss")
+    root = ET.fromstring(raw)
+    items = root.findall(".//item")
+    if not items:
+        raise RuntimeError("arXiv RSS feed contained no items")
+    papers = []
+    undated = 0
+    for item in items:
+        link = (item.findtext("link") or "").strip()
+        m = re.search(r"/abs/([^/]+)$", link)
+        if not m:
+            continue
+        aid = re.sub(r"v\d+$", "", m.group(1))
+        desc = item.findtext("description") or ""
+        desc = _clean(desc)
+        # RSS description is "arXiv:NNNN.NNNNNvN Announce Type: new\nAbstract: ..."
+        desc = re.sub(r"^arXiv:\S+\s*|^Announce Type:\s*\S+\s*", "", desc)
+        desc = re.sub(r"^Abstract:\s*", "", desc)
+        pub = None
+        try:
+            from email.utils import parsedate_to_datetime
+            pub = parsedate_to_datetime(item.findtext("pubDate") or "")
+        except Exception:  # noqa: BLE001
+            pub = None
+        if pub is None:
+            undated += 1
+            pub = end_dt
+        creators = item.findtext("{http://purl.org/dc/elements/1.1/}creator") or ""
+        announce = item.findtext("{http://arxiv.org/schemas/atom}announce_type") or ""
+        papers.append({
+            "id": aid,
+            "abs_url": f"https://arxiv.org/abs/{aid}",
+            "title": _clean(item.findtext("title") or ""),
+            "authors": [a.strip() for a in creators.split(",") if a.strip()],
+            "summary": desc,
+            "published": pub,
+            "announce_type": announce.strip(),
+        })
+    in_window = [p for p in papers if p["published"] >= start_dt]
+    if not in_window:
+        # Feed is a rolling "latest announcement" list; if its dates fall
+        # outside our window keep them anyway rather than dropping the day.
+        log(f"WARN arXiv RSS: {len(papers)} items but none inside the window "
+            f"— using them unfiltered (no-miss preference)")
+        in_window = papers
+    log(f"arXiv RSS fallback: {len(in_window)}/{len(papers)} items "
+        f"({undated} undated)")
+    return in_window
 
 
 def _dt(s: str) -> datetime | None:
@@ -463,16 +589,38 @@ def main() -> int:
     start_dt = now - timedelta(days=back)
     date_label = now.strftime("%Y-%m-%d %H:%M UTC")
 
-    # 1. Fetch
+    # 1. Fetch (API first; RSS fallback when the API IP-rate-limits us)
+    source = "api"
     try:
         raw = fetch_papers(start_dt, now)
         log(f"Fetched {len(raw)} raw entries [{start_dt.date()} .. {now.date()}]")
     except Exception as e:  # noqa: BLE001
-        log(f"FATAL arXiv fetch failed: {e}")
-        traceback.print_exc()
-        send_email(f"[WARN] arXiv cs.AI digest — fetch failed {date_label}",
-                   f"<pre>arXiv API error: {e}\n{traceback.format_exc()}</pre>")
-        return 2
+        log(f"arXiv API fetch failed ({e}) — trying RSS fallback")
+        try:
+            raw = fetch_papers_rss(start_dt, now)
+            source = "rss"
+            log(f"Fetched {len(raw)} raw entries via RSS "
+                f"[{start_dt.date()} .. {now.date()}]")
+        except Exception as e2:  # noqa: BLE001
+            log(f"FATAL arXiv fetch failed (api: {e}; rss: {e2})")
+            traceback.print_exc()
+            send_email(f"[WARN] arXiv cs.AI digest — fetch failed {date_label}",
+                       f"<pre>arXiv API error: {e}\n\narXiv RSS error: {e2}\n\n"
+                       f"{traceback.format_exc()}</pre>")
+            return 2
+
+    if not raw:
+        # The API window is measured against *submission* time, but arXiv
+        # announces papers a day or two later and the API index lags; a
+        # 0-paper API window therefore doesn't mean "nothing new". The RSS
+        # feed is announcement-fresh — use it before declaring a quiet day.
+        log("arXiv API returned nothing inside the window — checking RSS")
+        try:
+            raw = fetch_papers_rss(start_dt, now)
+            source = "rss"
+            log(f"Fetched {len(raw)} raw entries via RSS")
+        except Exception as e:  # noqa: BLE001
+            log(f"RSS cross-check failed: {e}")
 
     if not raw:
         log("No entries in window — nothing to do.")
@@ -553,7 +701,9 @@ def main() -> int:
     html = render_email_digest(date_label, text,
                                infographic_cids=[f"infographic{i}" for i in range(len(img_paths))],
                                img_sources=sources)
-    subject = f"[arXiv cs.AI digest] {now.strftime('%Y-%m-%d')} — {len(candidates)} new papers"
+    tag = "" if source == "api" else " (RSS fallback)"
+    subject = (f"[arXiv cs.AI digest] {now.strftime('%Y-%m-%d')} — "
+               f"{len(candidates)} new papers{tag}")
     send_email(subject, html, image_paths=img_paths)
 
     log(f"Done in {time.time()-start_all:.0f}s")
