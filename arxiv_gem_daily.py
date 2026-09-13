@@ -327,12 +327,16 @@ def fetch_papers_oai(start_dt: datetime, end_dt: datetime) -> list[dict]:
 
 
 def _dt(s: str) -> datetime | None:
+    """Parse an arXiv timestamp. Date-only strings (OAI `created`, datestamp)
+    come back naive — stamp them UTC so every datetime in this script is
+    timezone-aware and comparisons never mix naive with aware."""
     if not s:
         return None
     try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
     except ValueError:
         return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 def _clean(s: str) -> str:
@@ -780,7 +784,7 @@ def main() -> int:
     html = render_email_digest(date_label, text,
                                infographic_cids=[f"infographic{i}" for i in range(len(img_paths))],
                                img_sources=sources)
-    tag = "" if source == "api" else " (RSS fallback)"
+    tag = "" if source == "api" else f" ({source.upper()} fallback)"
     subject = (f"[arXiv cs.AI digest] {now.strftime('%Y-%m-%d')} — "
                f"{len(candidates)} new papers{tag}")
     send_email(subject, html, image_paths=img_paths)
