@@ -21,15 +21,31 @@ If you are an AI agent told to modify or operate this repo, read the
   500 on the plain cat query — the script instead pulls newest pages then
   filters locally by the Atom `published` date. Don't reintroduce a date-range
   search_query.
-- **Fetch resilience (two tiers)**: the API call runs a retry ladder
+- **Fetch resilience (three tiers)**: the API call runs a retry ladder
   (429/5xx + transient socket errors, exponential backoff, honours
-  `Retry-After`) across two hosts (`export.arxiv.org` → `arxiv.org`). If the
-  API is still unusable — GitHub runners share egress IPs and get IP-level
-  429s — the run falls back to the arXiv **RSS feed**
-  (`rss.arxiv.org/rss/cs.AI`, a different service) and tags the email subject
-  `(RSS fallback)`. This also covers the API's index lag: the API windows on
-  *submission* time while arXiv announces 1-2 days later, so a 0-paper API
-  window triggers the same RSS cross-check instead of a silent "nothing new".
+  `Retry-After`) across two hosts (`export.arxiv.org` → `arxiv.org`). Sources
+  are then tried in order — `api` → `rss` → `oai` — and the first that yields
+  in-window papers wins; the email subject is tagged with the fallback that
+  served it (e.g. `(OAI fallback)`).
+  - `rss` = `rss.arxiv.org/rss/cs.AI`. Announcement-fresh, but legitimately
+    **empty on Sat/Sun** (arXiv skips those announcement days).
+  - `oai` = `oaipmh.arxiv.org/oai` (`set=cs:cs`, `metadataPrefix=arXiv`),
+    full abstracts, announcement-dated, available at weekends. Records whose
+    `created` date is >30 days old are metadata churn and are dropped.
+  The API windows on *submission* time while arXiv announces 1-2 days later,
+  so a 0-paper API window falls through to the next source instead of
+  reporting a silent "nothing new".
+- **Never fail silently**: if no source yields papers *and* any source
+  errored, the run sends a WARN email and exits 2 — a green run always means
+  a digest was really produced (or the window was genuinely empty everywhere).
+- **Verification switches**: `ARXIV_FETCH_SOURCE=api|rss|oai` pins the first
+  source tried, `DIGEST_DRY_RUN=1` exercises everything but suppresses email.
+  Workflow inputs `fetch_source` / `dry_run` map to them, so a tier can be
+  proven on CI without emailing.
+- **Dedup state cache**: the `actions/cache` key must stay ROLLING
+  (`arxiv-seen-${{ github.run_id }}` + `restore-keys: arxiv-seen-`). A fixed
+  key always hits, a hit skips the save, and the dedup state then freezes —
+  every run re-reports the whole window.
 - **States**: only `state/seen_ids.json` is stateful (gitignored); everything
   else is idempotent.
 - **Local dev run** uses `~/.gemini-cli/auth.json`; CI writes it from secrets.
