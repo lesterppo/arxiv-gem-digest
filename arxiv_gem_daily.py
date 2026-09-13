@@ -56,6 +56,9 @@ except ImportError:
 ARXIV_API_HOSTS = ("export.arxiv.org", "arxiv.org")
 ARXIV_API_PATH = "/api/query"
 ARXIV_RSS = "https://rss.arxiv.org/rss/{cat}"
+ARXIV_OAI = "https://oaipmh.arxiv.org/oai"
+ARXIV_OAI_SET = "cs:cs"           # OAI sets are one level: cs:cs, not cs:cs.AI
+OAI_PAGE_CAP = 4                  # resumption-token pages to walk
 ARXIV_PAGE_SLEEP = 3.0            # arXiv etiquette: >=3s between API calls
 ARXIV_HTTP_TRIES = 4              # retry ladder per URL (429/5xx/transient)
 ARXIV_UA = os.environ.get("ARXIV_UA") or (
@@ -259,6 +262,68 @@ def fetch_papers_rss(start_dt: datetime, end_dt: datetime) -> list[dict]:
     log(f"arXiv RSS fallback: {len(in_window)}/{len(papers)} items "
         f"({undated} undated)")
     return in_window
+
+
+def fetch_papers_oai(start_dt: datetime, end_dt: datetime) -> list[dict]:
+    """Third source: arXiv's OAI-PMH endpoint — a separate service from both
+    the query API and the RSS feed, and the only fallback that still has data
+    at weekends (the RSS feed is legitimately empty Sat/Sun because arXiv
+    skips those announcement days). Records carry the full abstract, authors
+    and categories. Windows on the OAI datestamp (announcement date), which
+    is what a daily digest actually cares about."""
+    NS_OAI = {"oai": "http://www.openarchives.org/OAI/2.0/",
+              "a": "http://arxiv.org/OAI/arXiv/"}
+    base = (f"{ARXIV_OAI}?verb=ListRecords&metadataPrefix=arXiv"
+            f"&set={urllib.parse.quote(ARXIV_OAI_SET)}"
+            f"&from={start_dt.date().isoformat()}"
+            f"&until={end_dt.date().isoformat()}")
+    url = base
+    papers = []
+    for page in range(OAI_PAGE_CAP):
+        root = ET.fromstring(_http_get(url, label=f"arxiv-oai[{page}]"))
+        err = root.find(".//oai:error", NS_OAI)
+        if err is not None:
+            raise RuntimeError(f"OAI-PMH error: {err.get('code')}: "
+                               f"{(err.text or '').strip()[:160]}")
+        recs = root.findall(".//oai:record", NS_OAI)
+        for rec in recs:
+            ar = rec.find(".//a:arXiv", NS_OAI)
+            if ar is None:  # deleted/withdrawn record
+                continue
+            cats = (ar.findtext("a:categories", "", NS_OAI) or "").split()
+            if not cats or cats[0] != CATEGORY:  # primary category only
+                continue
+            aid = re.sub(r"v\d+$", "", (ar.findtext("a:id", "", NS_OAI) or "").strip())
+            if not aid:
+                continue
+            created = _dt((ar.findtext(".//a:created", "", NS_OAI) or "").strip())
+            # OAI re-announces metadata updates of old papers; those are churn,
+            # not new work — keep the pool to genuinely recent submissions.
+            if created and created < end_dt - timedelta(days=30):
+                continue
+            datestamp = rec.findtext("oai:header/oai:datestamp", "", NS_OAI)
+            ann = _dt(datestamp.strip()) if datestamp else None
+            papers.append({
+                "id": aid,
+                "abs_url": f"https://arxiv.org/abs/{aid}",
+                "title": _clean(ar.findtext("a:title", "", NS_OAI) or ""),
+                "authors": [a.findtext("a:keyname", "", NS_OAI) or ""
+                            for a in ar.findall(".//a:authors/a:author", NS_OAI)],
+                "summary": _clean(ar.findtext("a:abstract", "", NS_OAI) or ""),
+                "published": created or ann or end_dt,
+                "announce_type": "oai",
+            })
+        token_el = root.find(".//oai:resumptionToken", NS_OAI)
+        token = (token_el.text or "").strip() if token_el is not None else ""
+        if not token:
+            break
+        url = (f"{ARXIV_OAI}?verb=ListRecords&resumptionToken="
+               f"{urllib.parse.quote(token)}")
+        time.sleep(ARXIV_PAGE_SLEEP)
+    if not papers:
+        raise RuntimeError("OAI-PMH returned no cs.AI records in range")
+    log(f"arXiv OAI fallback: {len(papers)} primary-cs.AI records")
+    return papers
 
 
 def _dt(s: str) -> datetime | None:
@@ -593,16 +658,24 @@ def main() -> int:
     start_dt = now - timedelta(days=back)
     date_label = now.strftime("%Y-%m-%d %H:%M UTC")
 
-    # 1. Fetch. API first (richer metadata, primary-category filter); RSS
-    #    second — a different arXiv service that survives the API's IP-level
-    #    429s and is announcement-fresh, which also covers the API index lag
-    #    (the API windows on *submission* time, arXiv announces 1-2 days
-    #    later). ARXIV_FETCH_SOURCE=rss flips the order (used to test the
-    #    fallback path on CI).
-    prefer_rss = os.environ.get("ARXIV_FETCH_SOURCE", "auto").lower() == "rss"
-    order = [("rss", fetch_papers_rss), ("api", fetch_papers)]
-    if not prefer_rss:
-        order.reverse()
+    # 1. Fetch. Three independent arXiv services, tried in order; the first
+    #    that yields in-window papers wins:
+    #      api — richest metadata, but IP-rate-limits GitHub runner egress
+    #            (429) and windows on *submission* time, which lags the
+    #            announcement by 1-2 days;
+    #      rss — announcement-fresh, but legitimately EMPTY on Sat/Sun
+    #            (arXiv skips those announcement days);
+    #      oai — OAI-PMH, full abstracts, announcement-dated, available on
+    #            weekends too.
+    #    ARXIV_FETCH_SOURCE=api|rss|oai puts that source first (used to test
+    #    each tier on CI).
+    prefer = os.environ.get("ARXIV_FETCH_SOURCE", "auto").strip().lower()
+    order = [("api", fetch_papers), ("rss", fetch_papers_rss),
+             ("oai", fetch_papers_oai)]
+    if prefer in ("api", "rss", "oai"):
+        order.sort(key=lambda p: p[0] != prefer)
+        log(f"Fetch source forced to '{prefer}' (order: "
+            f"{' -> '.join(n for n, _ in order)})")
     sub = f"[{start_dt.date()} .. {now.date()}]"
     raw, source, errs = [], "api", []
     for name, fn in order:
@@ -616,14 +689,20 @@ def main() -> int:
         if raw:
             break
 
-    if not raw and len(errs) == len(order):
-        log("FATAL arXiv fetch failed on every source — " + "; ".join(errs))
-        send_email(f"[WARN] arXiv cs.AI digest — fetch failed {date_label}",
-                   f"<pre>{chr(10).join(errs)}\n\n{traceback.format_exc()}</pre>")
-        return 2
-
     if not raw:
-        log("No entries in window — nothing to do.")
+        # Distinguish a genuinely quiet window from a degraded run: if any
+        # source errored, arXiv may well have had papers we couldn't reach,
+        # so stay loud (WARN email + non-zero exit) instead of silently
+        # reporting success.
+        if errs:
+            log("FATAL arXiv fetch: no papers and source errors — "
+                + "; ".join(errs))
+            send_email(f"[WARN] arXiv cs.AI digest — fetch degraded {date_label}",
+                       "<pre>Every source that answered returned nothing in "
+                       "the window, and these sources failed:\n\n"
+                       f"{chr(10).join(errs)}</pre>")
+            return 2
+        log("No entries in window on any source — nothing to do.")
         return 0
 
     # 2. Dedup (skip already-analysed ids)
