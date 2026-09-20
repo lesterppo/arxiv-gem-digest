@@ -141,9 +141,16 @@ def _to_png(fig, out, dpi=200, tight=None):
 
 
 def render_arxiv_chart(score_lines: list[str], n_recommended: int = 1,
-                       filedate: str = "") -> str | None:
-    """Parse AGENT/TUNE score lines, draw a horizontal grouped bar chart
-    sorted high→low, value labels + top-pick callout + footer stats."""
+                       filedate: str = "", fetch_source: str = "api",
+                       n_screened: int = 0) -> str | None:
+    """Parse AGENT/TUNE score lines, draw a light-theme horizontal grouped
+    bar chart (section C spec): rows sorted by max(AGENT,TUNE) desc (best at
+    top), max 10 rows with overflow note, wrapped never-truncated labels,
+    mandatory subtitle (metric + date + source + counts), legend ABOVE the
+    plot, single footer fig.text line. Value labels on every bar so color
+    is never the only channel."""
+    import textwrap
+
     import matplotlib
     matplotlib.use("Agg")
     from matplotlib import pyplot as plt
@@ -151,63 +158,87 @@ def render_arxiv_chart(score_lines: list[str], n_recommended: int = 1,
     plt.rcParams["font.family"] = _FONTS
     plt.rcParams["axes.unicode_minus"] = False
 
+    FIG_BG = "#f7f9fb"
+    AX_BG = "white"
+    INK = "#1f2328"
+    NAVY_SERIES = "#1e4e79"
+    AMBER_SERIES = "#c98b3a"
+    MUTED = "#57606a"
+
     parsed = parse_score_lines(score_lines)
     if not parsed:
         return None
-    parsed = parsed[:8]
-    parsed.sort(key=lambda p: max(p["agent"], p["tune"]), reverse=True)
+    total = len(parsed)
+    parsed.sort(key=lambda p: (max(p["agent"], p["tune"]), p["agent"]),
+                reverse=True)
+    overflow = max(0, total - 10)
+    parsed = parsed[:10]
 
-    labels = [_shorten(p["title"], 34) for p in parsed]
+    def _alias(title: str) -> str:
+        short = " ".join(title.split()[:6])
+        # wrapped, never truncated with …
+        return "\n".join(textwrap.wrap(short, width=28) or ["?"])
+
+    labels = [_alias(p["title"]) for p in parsed]
     agent = [p["agent"] for p in parsed]
     tune = [p["tune"] for p in parsed]
+    # parsed is desc (best first); y=0 sits at the bottom by default, so
+    # invert_yaxis() below puts y=0 (best) at the top. Do NOT reverse here —
+    # reverse+invert double-flips and lands the weakest row on top.
     y = list(range(len(parsed)))
 
-    h = 3.2 + 0.62 * len(parsed)
-    fig, ax = plt.subplots(figsize=(9.2, h), facecolor=NAVY)
-    ax.set_facecolor(NAVY)
+    h = 3.6 + 0.72 * len(parsed)
+    fig, ax = plt.subplots(figsize=(9.6, h), facecolor=FIG_BG)
+    ax.set_facecolor(AX_BG)
     fig.suptitle("arXiv cs.AI Daily Picks — AGENT vs TUNE",
-                 x=0.02, y=0.99, ha="left", fontsize=17,
-                 fontweight="bold", color="white")
-    subtitle = filedate or datetime.now().strftime("%Y-%m-%d")
-    ax.text(-0.06, 1.2, subtitle, transform=ax.transAxes,
-            fontsize=9, color=GRID)
+                 x=0.02, y=0.99, ha="left", fontsize=16,
+                 fontweight="bold", color=INK)
+    date_s = filedate or datetime.now().strftime("%Y-%m-%d")
+    n_rec_disp = int(n_recommended) if n_recommended else 0
+    screened_s = n_screened or total
+    subtitle = (f"Scores 1–5 = pick strength (AGENT = agent-harness fit, "
+                f"TUNE = trainable on a T4) | {date_s} | "
+                f"source: arXiv cs.AI ({fetch_source}) | top {len(parsed)} "
+                f"of {screened_s} screened, {n_rec_disp} recommended"
+                + (f" | ＋{overflow} more in email" if overflow else ""))
+    fig.text(0.02, 0.94, subtitle, ha="left", fontsize=9, color=MUTED,
+             wrap=True)
 
-    ax.barh([y[i] + 0.2 for i in range(len(parsed))], agent, height=0.38,
-            color=TEAL, label="AGENT", alpha=0.95, zorder=3)
-    ax.barh([y[i] - 0.2 for i in range(len(parsed))], tune, height=0.38,
-            color=GREEN, label="TUNE", alpha=0.85, zorder=3)
+    # AGENT sits at y-0.2 so it renders ABOVE tune within each group (after
+    # invert_yaxis smaller y = visually higher), matching the legend order.
+    ax.barh([y[i] - 0.2 for i in range(len(parsed))], agent, height=0.38,
+            color=NAVY_SERIES, label="AGENT", alpha=0.95, zorder=3)
+    ax.barh([y[i] + 0.2 for i in range(len(parsed))], tune, height=0.38,
+            color=AMBER_SERIES, label="TUNE", alpha=0.95, zorder=3)
     for i in range(len(parsed)):
-        ax.text(agent[i] + 0.08, y[i] + 0.2, f"{agent[i]:g}", va="center",
-                fontsize=10, color="white", fontweight="bold")
-        ax.text(tune[i] + 0.08, y[i] - 0.2, f"{tune[i]:g}", va="center",
-                fontsize=10, color="white", fontweight="bold")
+        ax.text(agent[i] + 0.08, y[i] - 0.2, f"{agent[i]:g}", va="center",
+                fontsize=10, color=INK, fontweight="bold")
+        ax.text(tune[i] + 0.08, y[i] + 0.2, f"{tune[i]:g}", va="center",
+                fontsize=10, color=INK, fontweight="bold")
     ax.set_yticks(y)
-    ax.set_yticklabels(labels, fontsize=11, color="white")
-    ax.tick_params(axis="y", colors="white", labelcolor="white")
-    for lbl in ax.get_yticklabels():
-        lbl.set_color("white")
-        lbl.set_fontsize(11)
-    fig.subplots_adjust(left=0.30)
+    ax.set_yticklabels(labels, fontsize=10, color=INK)
+    ax.invert_yaxis()  # best score at top
+    ax.tick_params(axis="y", colors=INK, labelcolor=INK)
     ax.set_xlim(0, 5.6)
     ax.set_xticks([0, 1, 2, 3, 4, 5])
-    ax.set_xticklabels(["0", "1", "2", "3", "4", "5"], fontsize=10, color=GRID)
-    ax.set_xlabel("score / 5", fontsize=10, color=GRID)
-    ax.grid(axis="x", color=GRID, alpha=0.35, linestyle="--", zorder=0)
-    ax.tick_params(axis="y", colors="white")
-    ax.spines[["top", "right", "left"]].set_visible(False)
-    ax.spines["bottom"].set_color(GRID)
+    ax.set_xticklabels(["0", "1", "2", "3", "4", "5"], fontsize=10,
+                       color=MUTED)
+    ax.set_xlabel("score / 5", fontsize=10, color=MUTED)
+    ax.grid(axis="x", color="#d0d7de", alpha=0.8, linestyle="--", zorder=0)
+    for spine in ("top", "right", "left"):
+        ax.spines[spine].set_visible(False)
+    ax.spines["bottom"].set_color("#d0d7de")
+    # Legend ABOVE the plot, left-aligned under the subtitle — never
+    # inside the data area.
+    ax.legend(loc="upper left", bbox_to_anchor=(0, 1.06),
+              fontsize=10, frameon=False, labelcolor=INK, ncol=2)
 
-    n_rec_disp = int(n_recommended) if n_recommended else 1
-    rank_txt = (f"#{1}  {parsed[0]['id']}  ·  AGENT {parsed[0]['agent']:g} / "
-                f"TUNE {parsed[0]['tune']:g}  —  top pick")
-    ax.text(-0.06, 1.44, rank_txt, transform=ax.transAxes,
-            fontsize=11, color=AMBER, fontweight="bold")
-    ax.text(-0.06, -0.06,
-            f"{len(parsed)} papers · {n_rec_disp} recommended · "
-            "agent = agent-harness use · tune = trainable on a T4",
-            transform=ax.transAxes, fontsize=9, color=GRID)
-    ax.legend(loc="upper right", fontsize=9, frameon=False,
-              labelcolor="white", ncol=2)
+    fig.subplots_adjust(left=0.30, right=0.96, top=0.86, bottom=0.10)
+    # Single footer line — one fig.text only.
+    fig.text(0.5, 0.015,
+             "Automated screen — scores reflect agent/T4 relevance, "
+             "not paper quality.",
+             ha="center", fontsize=9, color=MUTED)
 
     out = os.path.join(OUT_ROOT, "arxiv", f"chart_{stamp()}.png")
     os.makedirs(os.path.dirname(out), exist_ok=True)
@@ -401,19 +432,27 @@ def build_arxiv_prompt(score_lines: list[str], n_recommended: int = 0,
 
 # ── yt-gem / finance digest infographic ────────────────────────────────────
 
+_SCORE_RE = re.compile(
+    r"(\d{4}\.\d{4,5})\s*[—–-]+\s*(.+?)\s*[—–-]+\s*"
+    r"AGENT\s*([1-5])\s*/\s*5\s*[—–-]+\s*TUNE\s*([1-5])")
+
+
 def parse_score_lines(score_lines: list[str]) -> list[dict]:
-    """Parse 'id — title — AGENT n/5 — TUNE n/5' lines (markdown tolerant)
-    into [{id,title,agent,tune,summary:''}]."""
+    """Parse 'id — title — AGENT n/5 — TUNE n/5' lines into
+    [{id,title,agent,tune,summary:''}]. Lines failing the score regex are
+    logged to stderr and excluded (never chart unparsed text). Markdown
+    bold markers are ignored for matching."""
+    import sys as _sys
     out = []
     for ln in score_lines:
-        m = re.match(
-            r"[\s*>#-]*\*{0,2}\s*(?:arxiv:?\s*)?(\d{4}\.\d{4,5})\S*\s*\*{0,2}"
-            r"\s*[—–-]+\s*(.+?)\s*[—–-]+\s*\*{0,2}\s*AGENT\s*(\d)\s*/\s*5"
-            r"\s*\*{0,2}\s*[—–-]+\s*\*{0,2}\s*TUNE\s*(\d)", ln, re.I)
-        if m:
-            pid, t, a, tu = m.groups()
-            out.append({"id": pid, "title": t.strip("* "), "agent": int(a),
-                        "tune": int(tu), "summary": ""})
+        m = _SCORE_RE.search(ln.replace("*", ""))
+        if not m:
+            print(f"[chart] score-line skipped (unparsed): "
+                  f"{ln.strip()[:120]}", file=_sys.stderr)
+            continue
+        pid, t, a, tu = m.groups()
+        out.append({"id": pid, "title": t.strip(" *"), "agent": int(a),
+                    "tune": int(tu), "summary": ""})
     return out
 
 
@@ -459,7 +498,8 @@ def build_videos_prompt(channel_label: str, items: list[dict],
         "color semantics. No invented tickers, numbers, or takeaways.")
 
 
-def arxiv_notebook_context(papers: list[dict], digest_text: str = "") -> str:
+def arxiv_notebook_context(papers: list[dict], digest_text: str = "",
+                         date_label: str = "") -> str:
     """Content-summary infographic instructions for the arXiv digest:
     visualize WHAT the recommended papers actually contribute — their core
     ideas, methods, and engineering takeaways. No score rankings."""
@@ -469,12 +509,17 @@ def arxiv_notebook_context(papers: list[dict], digest_text: str = "") -> str:
         if p.get("summary"):
             line += f": {p['summary'][:260]}"
         lines.append(line)
+    n = len(papers[:6])
+    m = sum(1 for p in papers[:6]
+            if max(p.get("agent", 0), p.get("tune", 0)) >= 4)
+    head_date = date_label or datetime.now().strftime("%Y-%m-%d")
     inst = (
-        "Create a dark-navy editorial infographic titled 'Today's AI Research "
-        "Briefing — what actually matters' that summarizes the CONTENT of "
-        "today's recommended arXiv cs.AI papers for an AI engineer. This is a "
-        "knowledge summary, NOT a scorecard: do not show numeric scores, "
-        "rankings, leaderboards, or rating bars.\n"
+        "Create a light-theme editorial infographic (background #f7f9fb, "
+        "ink #1f2328, navy #1e4e79 and amber #c98b3a accents) titled "
+        "'Today's AI Research Briefing — what actually matters' that "
+        "summarizes the CONTENT of today's recommended arXiv cs.AI papers "
+        "for an AI engineer. This is a knowledge summary, NOT a scorecard: "
+        "do not show numeric scores, rankings, leaderboards, or rating bars.\n"
         "Structure it as 4-6 content cards (one per paper), each card "
         "containing: the paper's short title, the core idea in one plain-"
         "English sentence, the key method or mechanism as a tiny labeled "
@@ -482,12 +527,20 @@ def arxiv_notebook_context(papers: list[dict], digest_text: str = "") -> str:
         "for:' practical takeaway line. Group cards by theme (e.g. agent "
         "memory, planning, fine-tuning) with small section headers.\n"
         "Base every statement ONLY on the paper summaries below — no invented "
-        "methods, numbers, or claims. Flat vector, dark navy background, "
-        "teal/amber accents, small crisp text, generous whitespace.\n\n"
+        "methods, numbers, or claims. Flat vector, light background, "
+        "navy/amber accents, small crisp text, generous whitespace.\n\n"
         "Papers (id — title — summary):\n" + "\n".join(lines))
     if digest_text:
         inst += "\n\nDeeper notes from the digest (for accurate takeaway "
         "phrasing):\n" + digest_text[:1400]
+    inst += (
+        "\nHEADER STRIP: copy this line verbatim at the top: "
+        f"\"arXiv cs.AI Daily Radar — {head_date} — {n} papers, "
+        f"{m} recommended\".\n"
+        "CARD HEADER: every card starts with 'Paper <full arXiv id> — "
+        "<short title>' and the id must match the attached source title "
+        "exactly; every diagram label must be a complete phrase "
+        "(min 2 words), never a bare '[X] vs [Y]' fragment.\n")
     return inst
 
 

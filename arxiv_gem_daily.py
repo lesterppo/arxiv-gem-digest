@@ -85,6 +85,10 @@ GEMINI_TIMEOUT = 280             # s per batch call
 MAX_CONCURRENT_GEM = 3
 GEMINI_RETRIES = 2
 TOTAL_TIMEOUT = 1200             # script hard timeout (CI timeout-minutes 25)
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_API_MODELS = ("gemini-3.5-flash", "gemini-flash-lite-latest",
+                     "gemini-2.5-flash")
+DEFERRED_FILE = os.path.join(SCRIPT_DIR, "state", "deferred_ids.json")
 
 # ── arXiv API ──────────────────────────────────────────────────────────────
 
@@ -400,33 +404,100 @@ def gemini_analyze(candidates: list[dict], batch_label: str) -> dict:
     return {"ok": False, "err": "unknown"}
 
 
+def _redact(msg: str) -> str:
+    """Strip the API key out of any error text before logging."""
+    if GEMINI_API_KEY and GEMINI_API_KEY in msg:
+        return msg.replace(GEMINI_API_KEY, "<redacted>")
+    return msg
+
+
+def _gemini_api(prompt: str, batch_label: str) -> dict:
+    """REST fallback ladder (mirrors gi_hep_weekly._gemini_api shape).
+
+    Tries gemini-3.5-flash -> gemini-flash-lite-latest -> gemini-2.5-flash
+    via GEMINI_API_KEY. Returns {ok, text|err, out, model}. Only called
+    when the web (cookie) path returns non-ok.
+    """
+    if not GEMINI_API_KEY:
+        return {"ok": False, "err": "no GEMINI_API_KEY"}
+    last_err = "unknown"
+    for model in GEMINI_API_MODELS:
+        try:
+            body = json.dumps({
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": 0.4,
+                                     "maxOutputTokens": 8192},
+            }).encode()
+            url = (f"https://generativelanguage.googleapis.com/v1beta/"
+                   f"models/{model}:generateContent?key={GEMINI_API_KEY}")
+            req = urllib.request.Request(
+                url, data=body, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+            cands = data.get("candidates", [])
+            parts = (cands[0].get("content", {}).get("parts", [])
+                     if cands else [])
+            txt = "".join(p.get("text", "") for p in parts).strip()
+            if not txt:
+                last_err = f"{model}: empty response"
+                log(f"  api {model}: empty response — next model")
+                continue
+            out = os.path.join(SCRIPT_DIR, "state",
+                               f"digest_{batch_label}.md")
+            os.makedirs(os.path.dirname(out), exist_ok=True)
+            with open(out, "w", encoding="utf-8") as f:
+                f.write(txt)
+            return {"ok": True, "text": txt, "out": out, "model": model}
+        except Exception as e:  # noqa: BLE001
+            last_err = f"{model}: {_redact(str(e))[:200]}"
+            log(f"  api {model} failed ({last_err}) — next model")
+    return {"ok": False, "err": last_err}
+
+
+def _have_web_auth() -> bool:
+    """True if the cookie (web) backend can run: env cookies or local auth.json."""
+    if os.environ.get("GEMINI_SID") and os.environ.get("GEMINI_TS"):
+        return True
+    try:
+        with open(os.path.expanduser("~/.gemini-cli/auth.json"),
+                  encoding="utf-8") as f:
+            d = json.load(f)
+        return bool(d.get("__Secure-1PSID"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return False
+
+
 def _build_prompt(candidates: list[dict]) -> str:
     lines = [
-        "You run a daily arXiv screening for an AI engineer building: "
-        "(A) a local AI-agent harness (tool calling, memory, agent loops, "
-        "multi-agent orchestration, evals, web/software agents, code gen), and "
-        "(B) small open-weights model fine-tune/training that fits on a FREE "
-        "Google Colab T4 (16GB VRAM) or small local GPU.",
+        "You run a daily arXiv screening for an AI engineer building: (A) a local AI-agent",
+        "harness (tool calling, memory, agent loops, multi-agent orchestration, evals,",
+        "web/software agents, code gen), and (B) small open-weights model fine-tune/training",
+        "that fits on a FREE Google Colab T4 (16GB VRAM) or small local GPU.",
         "",
-        f"Below are {len(candidates)} recent {CATEGORY} arXiv papers "
+        f"Below are {len(candidates)} recent cs.AI arXiv papers "
         "(title + author + abstract snippet + arXiv id).",
         "",
-        "For EVERY paper output one short scored line in EXACTLY this format "
-        "(keep the title SHORT — it must appear on the line so the reader can "
-        "judge relevance without clicking):",
-        "  arXiv-ID — Short title — AGENT n/5 — TUNE n/5",
+        "For EVERY paper output one short scored line in EXACTLY this format:",
+        "  arXiv-ID — Short title (≤8 words, no abbreviations you invented) — AGENT n/5 — TUNE n/5",
         "  - 'AGENT' 1-5: applicability to local AI-agent harness work (5 = directly reusable method/idea)",
-        "  - 'TUNE'  1-5: applicability to small-model fine-tune/training on free Colab T4 (5 = practical/implementable there)",
-        "  Do NOT give both low unless truly irrelevant.",
+        "  - 'TUNE' 1-5: applicability to small-model fine-tune/training on free Colab T4 (5 = practical/implementable there)",
+        "  - Score honestly: a chemistry benchmark or travel-planning study is AGENT 1-2 / TUNE 1-2.",
+        "    Never inflate to 3+ to \"be nice\". Both low is a legitimate and common answer.",
         "",
-        "Then a 'RECOMMENDED' section, papers with AGENT >=4 OR TUNE >=4, best first. "
-        "For each: a 1-3 sentence plain-English summary (what it does, the key idea), "
-        "WHY it matters for (A)/(B), and a concrete takeaway or minimal experiment "
-        "idea an engineer could try with local tools / a T4.",
+        "Then a 'RECOMMENDED' section: papers with AGENT >= 4 OR TUNE >= 4, best first, MAX 5 papers.",
+        "For each: a 1-3 sentence plain-English summary (what it does, the key idea; ≤120 words total),",
+        "WHY it matters for (A)/(B) (one sentence), and ONE concrete takeaway or minimal experiment",
+        "an engineer could try with local tools / a T4 (≤40 words, name the model size + method,",
+        "e.g. \"LoRA r=16 on Qwen2.5-Coder-3B, contrastive pairs from WebArena Go-Browse\").",
         "",
-        "Rules: be concrete not generic. A method that needs 100s of GPUs is NOT TUNE-applicable "
-        "— say so, or suggest a scaled-down variant only if realistic. No hallucinated claims "
-        "about the method. Respect each abstract's actual claims. If two papers overlap, cross-note.",
+        "Rules:",
+        "- Be concrete not generic. A method needing 100s of GPUs is NOT TUNE-applicable — say so",
+        "  (TUNE 1-2), or suggest a scaled-down variant ONLY if realistic on a 16GB T4.",
+        "- No hallucinated claims about the method. Respect each abstract's actual claims.",
+        "- If two papers overlap, cross-note in one line (\"Overlaps with <id>: <difference>\").",
+        "- Plain GitHub-flavoured markdown ONLY. No XML tags, no HTML tags, no <details>,",
+        "  no Elicitation/ElicitationsGroup blocks.",
+        "- Never invent arXiv IDs, titles, author names, numbers or URLs.",
         "",
         "Papers:",
     ]
@@ -468,6 +539,54 @@ def _prune_seen(seen: dict[str, str], keep_days: int = 7) -> dict[str, str]:
     cutoff = (datetime.now(timezone.utc) -
               timedelta(days=keep_days)).strftime("%Y-%m-%d")
     return {k: v for k, v in seen.items() if v >= cutoff}
+
+
+def _load_deferred() -> list[dict]:
+    """Load overflow papers deferred from the previous run (oldest first).
+
+    Stored as full records (id/title/authors/summary/published-iso) so the
+    next run can analyse them without re-fetching.
+    """
+    try:
+        with open(DEFERRED_FILE, encoding="utf-8") as f:
+            items = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+    out = []
+    for p in items if isinstance(items, list) else []:
+        if not isinstance(p, dict) or not p.get("id"):
+            continue
+        pub = p.get("published")
+        if isinstance(pub, str):
+            pub = _dt(pub)
+        p = dict(p)
+        p["published"] = pub
+        out.append(p)
+    return out
+
+
+def _save_deferred(papers: list[dict]) -> None:
+    """Persist un-analysed overflow for the next run (JSON-serializable)."""
+    os.makedirs(os.path.dirname(DEFERRED_FILE), exist_ok=True)
+    items = []
+    for p in papers:
+        pub = p.get("published")
+        if pub is None:
+            iso = ""
+        elif hasattr(pub, "isoformat"):
+            iso = pub.isoformat()
+        else:
+            iso = str(pub)
+        items.append({
+            "id": p.get("id", ""),
+            "abs_url": p.get("abs_url", ""),
+            "title": p.get("title", ""),
+            "authors": p.get("authors", []),
+            "summary": p.get("summary", ""),
+            "published": iso,
+        })
+    with open(DEFERRED_FILE, "w", encoding="utf-8") as f:
+        json.dump(items, f)
 
 
 # Email ─────────────────────────────────────────────────────────────────────
@@ -547,9 +666,70 @@ def send_email(subject: str, html_body: str,
 # HTML render ─────────────────────────────────────────────────────────────
 
 
+# Score post-processing (§B) ────────────────────────────────────────────────
+
+SCORE_RE = re.compile(
+    r"(\d{4}\.\d{4,5})\s*[—–-]+\s*(.+?)\s*[—–-]+\s*"
+    r"AGENT\s*([1-5])\s*/\s*5\s*[—–-]+\s*TUNE\s*([1-5])")
+
+
+def strip_harness_tags(text: str) -> str:
+    """Remove harness/XML/HTML tags leaked by the model. MUST run BEFORE
+    linkify so our own <a href> anchors survive."""
+    text = re.sub(r"</?Elicitation[^>]*>", "", text)
+    return re.sub(r"</?[A-Za-z][A-Za-z0-9]*(\s[^>]*)?>", "", text)
+
+
+def parse_scored_lines(text: str) -> list[dict]:
+    """Validate score lines with SCORE_RE; log + exclude unparsed lines
+    (never chart unparsed text). Sorted by max(AGENT,TUNE) desc, AGENT desc."""
+    out = []
+    for ln in text.splitlines():
+        if not re.search(r"AGENT", ln, re.I):
+            continue
+        m = SCORE_RE.search(ln.replace("*", ""))
+        if not m:
+            log(f"score-line skipped (unparsed): {ln.strip()[:120]}")
+            continue
+        pid, title, a, t = m.groups()
+        out.append({"id": pid, "title": title.strip(" *"),
+                    "agent": int(a), "tune": int(t)})
+    out.sort(key=lambda p: (max(p["agent"], p["tune"]), p["agent"]),
+             reverse=True)
+    return out
+
+
+def _chip(n: int) -> str:
+    """Color chip: 4-5 green, 3 amber, 1-2 grey."""
+    bg = "#1a7f37" if n >= 4 else ("#9a6700" if n == 3 else "#57606a")
+    return (f"<span style='display:inline-block;min-width:34px;text-align:center;"
+            f"background:{bg};color:#fff;border-radius:10px;padding:1px 8px;"
+            f"font-weight:bold;'>{n}/5</span>")
+
+
+def render_scores_table(rows: list[dict]) -> str:
+    """Scores as a sorted TABLE (ID linked | title | AGENT | TUNE)."""
+    if not rows:
+        return ""
+    trs = []
+    for r in rows:
+        pid = r["id"].replace("&", "&amp;").replace("<", "&lt;")
+        title = (r["title"].replace("&", "&amp;").replace("<", "&lt;")
+                 .replace(">", "&gt;"))
+        trs.append(
+            f"<tr><td><a href='https://arxiv.org/abs/{pid}'>{pid}</a></td>"
+            f"<td>{title}</td><td>{_chip(r['agent'])}</td>"
+            f"<td>{_chip(r['tune'])}</td></tr>")
+    return ("<h3>Scores</h3><table class='scores'><tr><th>ID</th>"
+            "<th>Short title</th><th>AGENT</th><th>TUNE</th></tr>"
+            + "".join(trs) + "</table>")
+
+
 def md_to_htmlish(text: str) -> str:
     """Markdown -> email-safe HTML: headings (#..####), **bold**, *italic*,
-    `code`, bullets (- and *), bare arXiv ids linkified. Escapes HTML first."""
+    `code`, bullets (- and *), bare arXiv ids linkified. Escapes HTML first.
+    Harness/XML tags are stripped BEFORE linkification."""
+    text = strip_harness_tags(text)
     esc = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     def _inline(s: str) -> str:
@@ -605,7 +785,9 @@ def md_to_htmlish(text: str) -> str:
 
 def render_email_digest(date_label: str, gemini_text: str,
                         infographic_cids: list[str] | None = None,
-                        img_sources: list[str] | None = None) -> str:
+                        img_sources: list[str] | None = None,
+                        backend: str = "web", fetch_source: str = "api",
+                        n_screened: int = 0, n_rec: int = 0) -> str:
     css = """
     <style>
       body{font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;
@@ -617,9 +799,14 @@ def render_email_digest(date_label: str, gemini_text: str,
       .meta{color:#57606a;font-size:13px;}
       a{color:#0969da;}
       ul{padding-left:20px;margin:4px 0 10px;}
+      table.scores{border-collapse:collapse;width:100%;margin:8px 0 12px;font-size:14px;}
+      table.scores th,table.scores td{border:1px solid #d0d7de;padding:5px 8px;text-align:left;}
+      table.scores th{background:#f6f8fa;}
       .infographic{width:100%;border-radius:10px;margin:14px 0 4px;}
       .cap{color:#57606a;font-size:12px;margin-bottom:12px;}
 </style>"""
+    rows = parse_scored_lines(strip_harness_tags(gemini_text))
+    scores_html = render_scores_table(rows)
     info_html = ""
     labels = ["Data-viz score chart (rendered locally from digest data: "
               "AGENT = agent-harness applicability, TUNE = Colab-T4 "
@@ -637,10 +824,10 @@ def render_email_digest(date_label: str, gemini_text: str,
         info_html += "<hr/>"
     return (f"<html><head><meta charset='utf-8'>{css}</head><body>"
             f"<h1>arXiv cs.AI — Gemini Daily Digest</h1>"
-            f"<div class='meta'>Generated {date_label}, model: Gemini Flash + "
-            f"Extended Thinking (gemini-webapi). "
-            f"Criteria: agent-harness applicability & small-model "
-            f"fine-tune-on-Colab-T4 applicability.</div><hr/>"
+            f"<div class='meta'>{date_label} · {n_screened} screened · "
+            f"{n_rec} recommended · backend: {backend} · "
+            f"source: {fetch_source}</div><hr/>"
+            f"{scores_html}"
             f"{md_to_htmlish(gemini_text)}"
             f"<hr/>{info_html}"
             f"<div class='meta'>Automated filter: not every arXiv paper is "
@@ -656,6 +843,19 @@ def main() -> int:
     start_all = time.time()
     log("=== arXiv cs.AI daily digest starting ===")
     setup_auth_from_env()
+
+    # Preflight: at least one LLM path required (fail fast with a clear
+    # error instead of a mid-run AUTH_EXPIRED mystery).
+    have_web = _have_web_auth()
+    if not have_web and not GEMINI_API_KEY:
+        log("FATAL: no LLM path configured (need GEMINI_SID/TS cookies "
+            "and/or GEMINI_API_KEY)")
+        return 2
+    if not have_web:
+        log("WARN: web cookies not set — web backend disabled, API only")
+    if not GEMINI_API_KEY:
+        log("WARN: GEMINI_API_KEY not set — no API fallback "
+            "(web cookies are single-point-of-failure)")
 
     now = datetime.now(timezone.utc)
     back = RUN_BACK_DAYS
@@ -709,9 +909,16 @@ def main() -> int:
         log("No entries in window on any source — nothing to do.")
         return 0
 
-    # 2. Dedup (skip already-analysed ids)
+    # 2. Dedup (skip already-analysed ids). Deferred overflow from the
+    #    previous run is prepended oldest-first before new fetches so
+    #    capped-off papers are never silently dropped.
     seen = _load_seen()
-    unknown = [p for p in raw if p["id"] not in seen]
+    deferred = [p for p in _load_deferred() if p.get("id") not in seen]
+    deferred_ids = {p["id"] for p in deferred}
+    pool = list(deferred) + [p for p in raw if p["id"] not in deferred_ids]
+    unknown = [p for p in pool if p["id"] not in seen]
+    if deferred:
+        log(f"requeued {len(deferred)} deferred paper(s) from previous run")
     if not unknown:
         log("All fetched papers already seen — no new candidates.")
         return 0
@@ -721,19 +928,36 @@ def main() -> int:
     candidates = unknown[:MAX_ABSTRACT_CANDIDATES]
     log(f"{len(unknown)} new papers; analysing top {len(candidates)} by date")
 
-    # 3. Mark candidates seen immediately (so a crash mid-run still blocks
-    #    re-dispatch; window overlap already protects, this is extra safety)
+    # 3. Gemini analysis — web (cookie) backend first, REST API ladder on
+    #    non-ok. Seen-marking happens ONLY after success (§E).
+    batch_label = now.strftime("%Y%m%d-%H%M")
+    backend = "web"
+    if have_web:
+        res = gemini_analyze(candidates, batch_label)
+    else:
+        res = {"ok": False, "err": "web backend disabled (no cookies)"}
+    if not res.get("ok") and GEMINI_API_KEY:
+        log(f"web backend failed ({res.get('err')}) — trying API ladder")
+        api_res = _gemini_api(_build_prompt(candidates), batch_label)
+        if api_res.get("ok"):
+            res = api_res
+            backend = f"api:{api_res.get('model', '?')}"
+    if not res.get("ok"):
+        log(f"Gemini analysis FAILED (backend tried: {backend}): "
+            f"{res.get('err')}")
+        _save_deferred(unknown)
+        return 1
+    log(f"backend={backend} analysis OK")
+
+    # 3b. Mark seen ONLY for analysed candidate IDs after successful
+    #     analysis; persist the remainder for the next run.
     today_key = now.strftime("%Y-%m-%d")
     for c in candidates:
         seen[c["id"]] = today_key
     _save_seen(_prune_seen(seen))
-
-    # 4. Gemini analysis
-    batch_label = now.strftime("%Y%m%d-%H%M")
-    res = gemini_analyze(candidates, batch_label)
-    if not res.get("ok"):
-        log(f"Gemini analysis FAILED: {res.get('err')}")
-        return 1
+    _save_deferred(unknown[len(candidates):])
+    log(f"deferred={len(unknown) - len(candidates)} paper(s) carried to "
+        f"state/deferred_ids.json")
 
     text = res.get("text", "")
     log(f"Gemini digest produced {len(text)} chars")
@@ -744,15 +968,20 @@ def main() -> int:
     #    downloaded. matplotlib chart kept as the immediate primary image.
     img_paths: list[str] = []
     sources: list[str] = []
+    n_rec = 0
     if infographic is not None:
         try:
-            score_lines = [ln.strip() for ln in text.splitlines()
-                           if re.search(r"AGENT\s*\d\s*/\s*5", ln, re.I)]
-            n_rec = len(re.findall(r"RECOMMENDED", text, re.I))
+            scored = parse_scored_lines(strip_harness_tags(text))
+            score_lines = [
+                f"{r['id']} — {r['title']} — AGENT {r['agent']}/5 — "
+                f"TUNE {r['tune']}/5" for r in scored]
+            n_rec = sum(1 for r in scored
+                        if max(r["agent"], r["tune"]) >= 4)
             # 5a. matplotlib chart — precise data visualization
             chart = infographic.render_arxiv_chart(
                 score_lines, n_recommended=n_rec,
-                filedate=now.strftime("%Y-%m-%d"))
+                filedate=now.strftime("%Y-%m-%d"),
+                fetch_source=source, n_screened=len(unknown))
             if chart:
                 img_paths.append(chart)
                 sources.append("matplotlib")
@@ -766,7 +995,9 @@ def main() -> int:
                     nb, infographic.nlm_arxiv_sources(
                         papers_ctx[:6], notes=rec_text))
                 log(f"NotebookLM: notebook {nb}, {n} sources")
-                inst = infographic.arxiv_notebook_context(papers_ctx[:6], rec_text[:1200])
+                inst = infographic.arxiv_notebook_context(
+                    papers_ctx[:6], rec_text[:1200],
+                    date_label=now.strftime("%Y-%m-%d"))
                 url = infographic.nlm_generate_infographic(nb, inst)
                 if url:
                     out = os.path.join(infographic.OUT_ROOT, "arxiv",
@@ -783,7 +1014,9 @@ def main() -> int:
     # 6. Compose + email (chart and gemini banner get separate CIDs)
     html = render_email_digest(date_label, text,
                                infographic_cids=[f"infographic{i}" for i in range(len(img_paths))],
-                               img_sources=sources)
+                               img_sources=sources, backend=backend,
+                               fetch_source=source,
+                               n_screened=len(unknown), n_rec=n_rec)
     tag = "" if source == "api" else f" ({source.upper()} fallback)"
     subject = (f"[arXiv cs.AI digest] {now.strftime('%Y-%m-%d')} — "
                f"{len(candidates)} new papers{tag}")
