@@ -86,3 +86,16 @@ On GitHub: **Actions → arXiv cs.AI Daily Digest → Run workflow** (optional
 - Gemini: one Flash+Extended call per run (batched candidates, `MAX 22`
   papers = ~1 longer prompt). Free gemini-webapi quota is ample for a daily run.
 - Email: one Gmail SMTP send.
+
+## Read-and-test experiments
+
+A daily agent job reads the latest cs.AI window with this digest's AGENT/TUNE
+criteria, picks the most relevant **testable** papers, and reproduces their
+core claims as small CPU-runnable experiments (GPU-bound ones are queued for
+the Colab-T4 track). Results land in `experiments/YYYY-MM-DD/` with measured
+numbers, verdicts, and honest limitations.
+
+- `experiments/2026-10-03/` — Mingbird harness mechanisms (prefill budget,
+  finish gate, loop detection — all checks passed) and the Kontoyiannis
+  entropy-rate filter from "No Model Required" (calibrated vs known rates,
+  tracks a 6-generation collapse sim, +19% pooled unique trigrams vs random).
