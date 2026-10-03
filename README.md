@@ -99,3 +99,8 @@ numbers, verdicts, and honest limitations.
   finish gate, loop detection — all checks passed) and the Kontoyiannis
   entropy-rate filter from "No Model Required" (calibrated vs known rates,
   tracks a 6-generation collapse sim, +19% pooled unique trigrams vs random).
+- `experiments/2026-10-03b/` — second same-day run: BDA council calibration
+  under adversarial coalitions (Brier 0.047 vs 0.180, adversaries inverted),
+  Causal Memory Policy retrieval intervention (AUC 0.45→0.82, positivity
+  violation exactly reproduced), FERPO forward-KL mode coverage (2/3 vs 1/3
+  modes) + SNIS weight health vs KL limit. All checks passed.
