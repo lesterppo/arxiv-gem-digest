@@ -36,6 +36,11 @@ jobs:
     concurrency:
       group: arxiv-digest
       cancel-in-progress: false
+    env:
+      # Mapped once at job level so step `if:` conditions can test it:
+      # the `secrets` context is NOT available inside `if:` expressions
+      # (GitHub rejects the whole workflow at parse time), but `env` is.
+      NLM_STORAGE_STATE_GZ: ${{ secrets.NLM_STORAGE_STATE_GZ }}
 
     steps:
       - uses: actions/checkout@v4
@@ -102,9 +107,7 @@ jobs:
         # Skipped when the secret is absent: the preflight only warns, and
         # the script degrades to the local chart — the setup must not fail
         # the whole digest for a missing/expired NLM session.
-        if: ${{ secrets.NLM_STORAGE_STATE_GZ != '' }}
-        env:
-          NLM_STORAGE_STATE_GZ: ${{ secrets.NLM_STORAGE_STATE_GZ }}
+        if: ${{ env.NLM_STORAGE_STATE_GZ != '' }}
         run: |
           mkdir -p ~/.notebooklm/profiles/default
           printf '%s' "$NLM_STORAGE_STATE_GZ" | base64 -d | gunzip >             ~/.notebooklm/profiles/default/storage_state.json
@@ -112,7 +115,7 @@ jobs:
 
       - name: Install playwright + CJK fonts (infographic download/render)
         # Only needed when NotebookLM is configured (see above).
-        if: ${{ secrets.NLM_STORAGE_STATE_GZ != '' }}
+        if: ${{ env.NLM_STORAGE_STATE_GZ != '' }}
         run: |
           pip install playwright
           python3 -m playwright install chromium --with-deps
