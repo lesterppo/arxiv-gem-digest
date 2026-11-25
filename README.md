@@ -26,6 +26,11 @@ Gemini Flash+Extended reads title+abstract batch → per-paper AGENT/TUNE
 scores + a RECOMMENDED section with concrete takeaways / minimal experiments
         ▼
 HTML email via Gmail SMTP
+
+Overflow beyond the 22-paper batch is deferred to the next run — but only
+inside the 2-day window (capped at 200 newest). Out-of-window overflow is
+dropped: newest-first ordering means it would never be picked, and carrying
+it forever grew the deferred file to 11 MB by 2026-11-25.
 ```
 
 Reasons a paper is *not* recommended are respected: a method that needs a
