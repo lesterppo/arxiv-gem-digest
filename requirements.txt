@@ -1,9 +1,14 @@
 # arxiv-gem-digest runtime deps (GitHub Actions runner)
 # gemini.py uses gemini-webapi (cookie auth) + curl_cffi; stdlib elsewhere.
 # matplotlib renders the data-viz conclusion infographic locally.
-gemini-webapi>=2.0.0
-curl_cffi>=0.7.0
-loguru
-browser-cookie3
-matplotlib>=3.8
-notebooklm-py>=0.8.1
+# Exact pins: resolved 2026-11-25 in a fresh venv (pip --dry-run) and
+# verified by the CI dry run after this change. Do NOT bump one pin alone:
+# gemini-webapi 2.1.1 requires curl-cffi~=0.16.2 AND loguru~=0.7.3 — the
+# 2026-11-24 GI-digest review pinned 0.17.0/0.8.0 and pip refused to
+# resolve (same failure mode; loose pins hid it here until a bump).
+gemini-webapi==2.1.1
+curl_cffi==0.16.3
+loguru==0.7.3
+browser-cookie3==0.20.1
+matplotlib==3.11.2
+notebooklm-py==0.8.6
