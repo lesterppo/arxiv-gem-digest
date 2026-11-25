@@ -1,0 +1,46 @@
+name: Keepalive — self re-enable (8-week push)
+
+# GitHub disables scheduled workflows after 60 days without a push to the
+# repo. The digest runs commit state on every successful run, so this is
+# only a backstop for quiet stretches (no successful runs for weeks): it
+# checks weekly and pushes a heartbeat commit if the repo has had no push
+# in the last 7 weeks (49 days) — guaranteeing a push at least once per
+# 8-week window, with a week of margin before GitHub's 60-day cutoff.
+# The push itself is the keepalive; the file content is only a timestamp
+# for humans.
+on:
+  schedule:
+    - cron: "0 3 * * 0"  # Sundays 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: keepalive
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Push heartbeat if quiet for 7+ weeks
+        run: |
+          last_push=$(git log -1 --format=%ct)
+          now=$(date +%s)
+          age_days=$(( (now - last_push) / 86400 ))
+          echo "last push: $(git log -1 --format=%ci) ($age_days days ago)"
+          if [ "$age_days" -lt 49 ]; then
+            echo "repo pushed $age_days days ago — no keepalive needed"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          printf '# Keepalive\n\nLast heartbeat push: %s UTC\n\nThis file exists only so the repo gets a push at least once per 8-week window (GitHub disables scheduled workflows after 60 days without a push). The digest runs normally commit state on every successful run; this is the backstop for quiet stretches.\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > .github/keepalive.md
+          git add .github/keepalive.md
+          git commit -m "keepalive: heartbeat $(date -u +%Y-%m-%d)" --quiet
+          git pull --rebase --quiet && git push --quiet || \
+            echo "::warning::keepalive push failed (will retry next Sunday)"
