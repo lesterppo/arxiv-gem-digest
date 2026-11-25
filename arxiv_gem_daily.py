@@ -91,6 +91,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_API_MODELS = ("gemini-3.5-flash", "gemini-flash-lite-latest",
                      "gemini-2.5-flash")
 DEFERRED_FILE = os.path.join(SCRIPT_DIR, "state", "deferred_ids.json")
+MAX_DEFERRED = 200               # cap on the deferred overflow queue (newest)
 
 # ── arXiv API ──────────────────────────────────────────────────────────────
 
@@ -543,11 +544,16 @@ def _prune_seen(seen: dict[str, str], keep_days: int = 7) -> dict[str, str]:
     return {k: v for k, v in seen.items() if v >= cutoff}
 
 
-def _load_deferred() -> list[dict]:
+def _load_deferred(cutoff: datetime | None = None) -> list[dict]:
     """Load overflow papers deferred from the previous run (oldest first).
 
     Stored as full records (id/title/authors/summary/published-iso) so the
-    next run can analyse them without re-fetching.
+    next run can analyse them without re-fetching. Entries older than
+    `cutoff` (the current window start) are dropped: the digest covers a
+    2-day window and newest-first ordering means out-of-window papers
+    would never be picked — carrying them forever only grew the file
+    (11 MB, ~6,000 papers by 2026-11-25) and inflated the 'screened'
+    count to 6,131 on the 2026-11-25 dry run.
     """
     try:
         with open(DEFERRED_FILE, encoding="utf-8") as f:
@@ -561,17 +567,33 @@ def _load_deferred() -> list[dict]:
         pub = p.get("published")
         if isinstance(pub, str):
             pub = _dt(pub)
+        if cutoff is not None and pub is not None and pub < cutoff:
+            continue
         p = dict(p)
         p["published"] = pub
         out.append(p)
     return out
 
 
-def _save_deferred(papers: list[dict]) -> None:
-    """Persist un-analysed overflow for the next run (JSON-serializable)."""
+def _save_deferred(papers: list[dict],
+                   cutoff: datetime | None = None) -> None:
+    """Persist un-analysed overflow for the next run (JSON-serializable).
+    Drops out-of-window papers and caps the queue at MAX_DEFERRED newest —
+    the backlog used to grow without bound (11 MB by 2026-11-25) because
+    newest-first ordering never drains it; only the window-bounded
+    overflow (at most ~2 days) has any chance of being picked next run."""
+    keep = []
+    for p in papers:
+        pub = p.get("published")
+        if cutoff is not None and pub is not None and pub < cutoff:
+            continue
+        keep.append(p)
+    keep.sort(key=lambda p: p.get("published") or
+              datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    keep = keep[:MAX_DEFERRED]
     os.makedirs(os.path.dirname(DEFERRED_FILE), exist_ok=True)
     items = []
-    for p in papers:
+    for p in keep:
         pub = p.get("published")
         if pub is None:
             iso = ""
@@ -930,7 +952,7 @@ def main() -> int:
     #    previous run is prepended oldest-first before new fetches so
     #    capped-off papers are never silently dropped.
     seen = _load_seen()
-    deferred = [p for p in _load_deferred() if p.get("id") not in seen]
+    deferred = [p for p in _load_deferred(start_dt) if p.get("id") not in seen]
     deferred_ids = {p["id"] for p in deferred}
     pool = list(deferred) + [p for p in raw if p["id"] not in deferred_ids]
     unknown = [p for p in pool if p["id"] not in seen]
@@ -962,7 +984,7 @@ def main() -> int:
     if not res.get("ok"):
         log(f"Gemini analysis FAILED (backend tried: {backend}): "
             f"{res.get('err')}")
-        _save_deferred(unknown)
+        _save_deferred(unknown, start_dt)
         return 1
     log(f"backend={backend} analysis OK")
 
@@ -1054,7 +1076,7 @@ def main() -> int:
         for c in candidates:
             seen[c["id"]] = today_key
         _save_seen(_prune_seen(seen))
-        _save_deferred(unknown[len(candidates):])
+        _save_deferred(unknown[len(candidates):], start_dt)
         log(f"deferred={len(unknown) - len(candidates)} paper(s) carried to "
             f"state/deferred_ids.json")
 
