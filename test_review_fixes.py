@@ -179,8 +179,11 @@ check("daily: contents write permission",
       "contents: write" in daily)
 check("daily: checkout full history (rebase before push)",
       "fetch-depth: 0" in daily)
-check("daily: NLM setup conditional on the secret",
-      "if: ${{ secrets.NLM_STORAGE_STATE_GZ != '' }}" in daily)
+check("daily: NLM setup conditional on the secret (via job env — "
+      "secrets is not usable in if:)",
+      "if: ${{ env.NLM_STORAGE_STATE_GZ != '' }}" in daily
+      and "secrets.NLM_STORAGE_STATE_GZ != ''" not in daily
+      and "NLM_STORAGE_STATE_GZ: ${{ secrets.NLM_STORAGE_STATE_GZ }}" in daily)
 check("daily: commit digest state step present",
       "Commit digest state" in daily)
 check("daily: commit gated on digest success",
