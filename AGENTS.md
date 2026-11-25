@@ -52,6 +52,13 @@ If you are an AI agent told to modify or operate this repo, read the
   scheduled-workflow clock (see README "Staying alive"). The cache is the
   fast path; the committed copy is the durable fallback if the cache is
   evicted. Never commit them by hand from a dev machine.
+- **Deferred overflow is window-bounded**: `state/deferred_ids.json` keeps
+  only un-analysed papers inside the current 2-day window, capped at 200
+  newest. It used to grow without bound (11 MB, ~6,000 papers by
+  2026-11-25) because newest-first ordering never drains it — and the
+  'screened' count in the email was inflated by that stale backlog
+  (6,131 on the 2026-11-25 dry run). Out-of-window overflow is dropped,
+  not carried forever.
 - **Email honesty**: `send_email` returns False on failure and `main()`
   exits 1 — a green run always means a digest was really delivered. Seen
   is marked ONLY after a confirmed send, and never in dry-run mode.
