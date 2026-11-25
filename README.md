@@ -31,6 +31,27 @@ HTML email via Gmail SMTP
 Reasons a paper is *not* recommended are respected: a method that needs a
 GPU cluster is flagged TUNE-low rather than forced into a T4 recipe.
 
+## Staying alive (GitHub's 60-day rule)
+
+GitHub disables scheduled workflows after 60 days without a push to the
+repo — the daily runs alone do not count, which is why this workflow was
+warned on 2026-11-25 after the last push (2026-10-03). Two mechanisms
+keep it alive, both added 2026-11-25:
+
+- **State commit**: every successful run commits `state/seen_ids.json` +
+  `state/deferred_ids.json` to the repo (force-added — the files stay
+  gitignored locally so a dev machine never commits them by accident).
+  Each run is therefore its own keepalive push. The commit is gated on
+  the digest step succeeding: if the email fails, the script exits
+  non-zero and the state is NOT committed, so those papers are retried
+  next run instead of being marked seen-and-lost.
+- **Keepalive workflow** (`.github/workflows/keepalive.yml`): checks
+  weekly (Sundays 03:00 UTC) and pushes a heartbeat commit if the repo
+  has had no push in the last 7 weeks (49 days) — guaranteeing a push at
+  least once per 8-week window, with a week of margin before GitHub's
+  60-day cutoff. Backstop only; the daily state commit normally fires
+  first.
+
 ## Files
 
 | File | Purpose |
@@ -39,7 +60,9 @@ GPU cluster is flagged TUNE-low rather than forced into a T4 recipe.
 | `gemini.py` | gemini-webapi CLI backend (cookie auth) |
 | `urllib_session.py` | HTTP session helper for gemini.py |
 | `.github/workflows/daily.yml` | Daily 02:00 UTC cron + manual dispatch |
-| `requirements.txt` | Python deps |
+| `.github/workflows/keepalive.yml` | Weekly self re-enable push (8-week window) |
+| `test_review_fixes.py` | Offline tests for the 2026-11-25 review fixes |
+| `requirements.txt` | Python deps (exact pins — see the comment there) |
 
 ## Setup
 
@@ -79,6 +102,11 @@ RUN_BACK_DAYS=5 MAX_CANDIDATES=30 python3 arxiv_gem_daily.py
 
 On GitHub: **Actions → arXiv cs.AI Daily Digest → Run workflow** (optional
 `back_days`, `max_candidates` inputs).
+
+A dry run (`dry_run: 1`) exercises the whole pipeline but sends no email —
+and, since 2026-11-25, it does NOT mark papers seen either, so the next
+real run still reports them. An email failure now fails the run (non-zero
+exit) instead of silently reporting success.
 
 ## Token / cost profile
 
