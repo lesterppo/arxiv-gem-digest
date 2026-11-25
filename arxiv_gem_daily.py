@@ -84,7 +84,9 @@ GEMINI_THINKING = "extended"     # Extended-thinking tier
 GEMINI_TIMEOUT = 280             # s per batch call
 MAX_CONCURRENT_GEM = 3
 GEMINI_RETRIES = 2
-TOTAL_TIMEOUT = 1200             # script hard timeout (CI timeout-minutes 25)
+TOTAL_TIMEOUT = 1200             # script hard timeout (CI timeout-minutes 45)
+NLM_BUDGET_S = 600               # skip NotebookLM once this many seconds
+                                 # elapsed (matplotlib chart already shipped)
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_API_MODELS = ("gemini-3.5-flash", "gemini-flash-lite-latest",
                      "gemini-2.5-flash")
@@ -608,8 +610,11 @@ def _load_smtp_pass() -> str:
 
 def send_email(subject: str, html_body: str,
                image_paths: list[str] | str | None = None,
-               cids: list[str] | None = None) -> None:
-    """Send HTML email with optional inline CID images (chart, gemini banner)."""
+               cids: list[str] | None = None) -> bool:
+    """Send HTML email with optional inline CID images (chart, gemini banner).
+    Returns True if sent (or suppressed in dry-run mode), False on failure.
+    Callers must NOT mark papers seen when this returns False — a green run
+    must always mean a digest was really delivered."""
     try:
         with open("/tmp/arxiv_digest_email.html", "w") as f:
             f.write(html_body)
@@ -618,7 +623,7 @@ def send_email(subject: str, html_body: str,
 
     if os.environ.get("DIGEST_DRY_RUN", "").lower() in ("1", "true", "yes"):
         log(f"DRY RUN — email suppressed (would send: {subject})")
-        return
+        return True
 
     if isinstance(image_paths, str):
         image_paths = [image_paths]
@@ -628,7 +633,7 @@ def send_email(subject: str, html_body: str,
     pas = _load_smtp_pass()
     if not pas:
         log("ERROR: no SMTP_PASS — cannot send email")
-        return
+        return False
     if image_paths:
         alt = MIMEMultipart("alternative")
         alt.attach(MIMEText("Digest delivered as HTML — enable HTML view.",
@@ -659,8 +664,20 @@ def send_email(subject: str, html_body: str,
         server.quit()
         log(f"Email sent to {RECIPIENT} ({len(html_body)} chars"
             + (f", {len(image_paths)} image(s)" if image_paths else "") + ")")
+        return True
     except Exception as e:  # noqa: BLE001
         log(f"ERROR sending email: {e}")
+        return False
+
+
+def _nlm_over_budget(start_all: float,
+                     budget_s: int = NLM_BUDGET_S) -> bool:
+    """True once the run-relative NotebookLM budget is spent. NotebookLM is
+    the unbounded step (notebook create + source attach + image generation +
+    download); the matplotlib chart is already shipped by then, so skipping
+    NLM still leaves a complete digest — and the email still goes out
+    inside the CI timeout."""
+    return (time.time() - start_all) > budget_s
 
 
 # HTML render ─────────────────────────────────────────────────────────────
@@ -949,16 +966,9 @@ def main() -> int:
         return 1
     log(f"backend={backend} analysis OK")
 
-    # 3b. Mark seen ONLY for analysed candidate IDs after successful
-    #     analysis; persist the remainder for the next run.
-    today_key = now.strftime("%Y-%m-%d")
-    for c in candidates:
-        seen[c["id"]] = today_key
-    _save_seen(_prune_seen(seen))
-    _save_deferred(unknown[len(candidates):])
-    log(f"deferred={len(unknown) - len(candidates)} paper(s) carried to "
-        f"state/deferred_ids.json")
-
+    # NOTE: seen-marking moved to AFTER the email send (step 6). Marking
+    # here would consume papers even when the email then fails — or when
+    # the run is a dry run that sends nothing.
     text = res.get("text", "")
     log(f"Gemini digest produced {len(text)} chars")
 
@@ -985,28 +995,35 @@ def main() -> int:
             if chart:
                 img_paths.append(chart)
                 sources.append("matplotlib")
-            # 5b. NotebookLM infographic (grounded in attached sources)
-            try:
-                papers_ctx = infographic.parse_score_lines(score_lines)
-                nb_title = f"arXiv cs.AI Daily Digest — {now.strftime('%Y-%m-%d')}"
-                nb = infographic.nlm_ensure_notebook(nb_title)
-                rec_text = text[text.find("RECOMMENDED"):] if "RECOMMENDED" in text else ""
-                n = infographic.nlm_add_text_sources(
-                    nb, infographic.nlm_arxiv_sources(
-                        papers_ctx[:6], notes=rec_text))
-                log(f"NotebookLM: notebook {nb}, {n} sources")
-                inst = infographic.arxiv_notebook_context(
-                    papers_ctx[:6], rec_text[:1200],
-                    date_label=now.strftime("%Y-%m-%d"))
-                url = infographic.nlm_generate_infographic(nb, inst)
-                if url:
-                    out = os.path.join(infographic.OUT_ROOT, "arxiv",
-                                       f"nlm_{now.strftime('%Y%m%d-%H%M')}.png")
-                    infographic.nlm_download_image(url, out)
-                    img_paths.append(out)
-                    sources.append("notebooklm")
-            except Exception as ne:  # noqa: BLE001
-                log(f"NotebookLM infographic failed (digest continues): {ne}")
+            # 5b. NotebookLM infographic (grounded in attached sources).
+            #     Run-relative budget: skip it once NLM_BUDGET_S has elapsed
+            #     — the matplotlib chart is already shipped, and the email
+            #     still goes out inside the CI timeout.
+            if _nlm_over_budget(start_all):
+                log(f"NotebookLM skipped: {time.time()-start_all:.0f}s "
+                    f"elapsed (budget {NLM_BUDGET_S}s) — chart only")
+            else:
+                try:
+                    papers_ctx = infographic.parse_score_lines(score_lines)
+                    nb_title = f"arXiv cs.AI Daily Digest — {now.strftime('%Y-%m-%d')}"
+                    nb = infographic.nlm_ensure_notebook(nb_title)
+                    rec_text = text[text.find("RECOMMENDED"):] if "RECOMMENDED" in text else ""
+                    n = infographic.nlm_add_text_sources(
+                        nb, infographic.nlm_arxiv_sources(
+                            papers_ctx[:6], notes=rec_text))
+                    log(f"NotebookLM: notebook {nb}, {n} sources")
+                    inst = infographic.arxiv_notebook_context(
+                        papers_ctx[:6], rec_text[:1200],
+                        date_label=now.strftime("%Y-%m-%d"))
+                    url = infographic.nlm_generate_infographic(nb, inst)
+                    if url:
+                        out = os.path.join(infographic.OUT_ROOT, "arxiv",
+                                           f"nlm_{now.strftime('%Y%m%d-%H%M')}.png")
+                        infographic.nlm_download_image(url, out)
+                        img_paths.append(out)
+                        sources.append("notebooklm")
+                except Exception as ne:  # noqa: BLE001
+                    log(f"NotebookLM infographic failed (digest continues): {ne}")
             log(f"Infographics ({'+'.join(sources) or 'none'}): {len(img_paths)} image(s)")
         except Exception as e:  # noqa: BLE001
             log(f"Infographic skipped: {e}")
@@ -1020,7 +1037,26 @@ def main() -> int:
     tag = "" if source == "api" else f" ({source.upper()} fallback)"
     subject = (f"[arXiv cs.AI digest] {now.strftime('%Y-%m-%d')} — "
                f"{len(candidates)} new papers{tag}")
-    send_email(subject, html, image_paths=img_paths)
+    sent = send_email(subject, html, image_paths=img_paths)
+    if not sent:
+        # Email never went out — do NOT mark papers seen (they retry next
+        # run) and fail the run, so a green CI run always means delivered.
+        log("Email NOT sent — seen state NOT updated; failing the run")
+        return 1
+    if os.environ.get("DIGEST_DRY_RUN", "").lower() in ("1", "true", "yes"):
+        # Dry run exercised the pipeline but sent nothing — do not consume
+        # the papers, or the next real run would skip them.
+        log("DRY RUN — seen state NOT updated (papers stay for the real run)")
+    else:
+        # Mark seen ONLY for analysed candidate IDs after a CONFIRMED send;
+        # persist the remainder for the next run.
+        today_key = now.strftime("%Y-%m-%d")
+        for c in candidates:
+            seen[c["id"]] = today_key
+        _save_seen(_prune_seen(seen))
+        _save_deferred(unknown[len(candidates):])
+        log(f"deferred={len(unknown) - len(candidates)} paper(s) carried to "
+            f"state/deferred_ids.json")
 
     log(f"Done in {time.time()-start_all:.0f}s")
     return 0
