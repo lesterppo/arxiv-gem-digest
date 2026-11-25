@@ -27,18 +27,21 @@ on:
         type: string
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   digest:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
     concurrency:
       group: arxiv-digest
       cancel-in-progress: false
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history: the state-commit step rebases before pushing.
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -96,6 +99,10 @@ jobs:
             "$GEMINI_SID" "$GEMINI_TS" > ~/.gemini-cli/auth.json
 
       - name: Setup NotebookLM session (storage state)
+        # Skipped when the secret is absent: the preflight only warns, and
+        # the script degrades to the local chart — the setup must not fail
+        # the whole digest for a missing/expired NLM session.
+        if: ${{ secrets.NLM_STORAGE_STATE_GZ != '' }}
         env:
           NLM_STORAGE_STATE_GZ: ${{ secrets.NLM_STORAGE_STATE_GZ }}
         run: |
@@ -104,6 +111,8 @@ jobs:
           python3 -c "import json;d=json.load(open('$HOME/.notebooklm/profiles/default/storage_state.json'));print('nlm cookies:',len(d.get('cookies',[])))"
 
       - name: Install playwright + CJK fonts (infographic download/render)
+        # Only needed when NotebookLM is configured (see above).
+        if: ${{ secrets.NLM_STORAGE_STATE_GZ != '' }}
         run: |
           pip install playwright
           python3 -m playwright install chromium --with-deps
@@ -121,6 +130,7 @@ jobs:
           restore-keys: arxiv-seen-
 
       - name: Run arXiv Gemini digest
+        id: digest
         env:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
@@ -130,13 +140,41 @@ jobs:
           ARXIV_FETCH_SOURCE: ${{ github.event.inputs.fetch_source }}
           DIGEST_DRY_RUN: ${{ github.event.inputs.dry_run }}
         run: |
+          # Each dispatch input is passed independently (previously
+          # max_candidates was silently ignored unless back_days was set).
           if [ -n "${{ github.event.inputs.back_days }}" ]; then
-            RUN_BACK_DAYS="${{ github.event.inputs.back_days }}" \
-            MAX_CANDIDATES="${{ github.event.inputs.max_candidates }}" \
-            python3 arxiv_gem_daily.py
-          else
-            python3 arxiv_gem_daily.py
+            export RUN_BACK_DAYS="${{ github.event.inputs.back_days }}"
           fi
+          if [ -n "${{ github.event.inputs.max_candidates }}" ]; then
+            export MAX_CANDIDATES="${{ github.event.inputs.max_candidates }}"
+          fi
+          python3 arxiv_gem_daily.py
+
+      - name: Commit digest state (keeps the 60-day clock reset)
+        # The seen/deferred state is the only stateful data, and it lives in
+        # actions/cache — but a cache-only state never pushes, so the repo
+        # still hits GitHub's 60-day scheduled-workflow disable (last push
+        # 2026-10-03; warning 2026-11-25). Committing the state after every
+        # successful run makes each run its own keepalive. Force-add: the
+        # files stay gitignored locally so a dev machine never commits them
+        # by accident — only CI commits them, only on a successful run.
+        # Runs only when the digest step succeeded: if the email failed, the
+        # script exits non-zero and the state is NOT committed, so those
+        # papers are retried next run instead of being marked seen-and-lost.
+        # A failed push only warns (the cache still holds the state); the
+        # keepalive workflow is the backstop for the 60-day clock.
+        if: steps.digest.outcome == 'success'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f state/seen_ids.json state/deferred_ids.json
+          if git diff --cached --quiet; then
+            echo "digest state unchanged — nothing to commit"
+            exit 0
+          fi
+          git commit -m "digest state $(date -u +%Y-%m-%d)" --quiet
+          git pull --rebase --quiet && git push --quiet || \
+            echo "::warning::digest-state push failed (state still in cache; keepalive workflow is the backstop)"
 
       - name: Upload digest artifacts (QA)
         if: always()
