@@ -46,8 +46,15 @@ If you are an AI agent told to modify or operate this repo, read the
   (`arxiv-seen-${{ github.run_id }}` + `restore-keys: arxiv-seen-`). A fixed
   key always hits, a hit skips the save, and the dedup state then freezes —
   every run re-reports the whole window.
-- **States**: only `state/seen_ids.json` is stateful (gitignored); everything
-  else is idempotent.
+- **States**: only `state/seen_ids.json` (+ `state/deferred_ids.json`) is
+  stateful. Both stay gitignored locally, but CI force-commits them after
+  every successful run — the commit is what resets GitHub's 60-day
+  scheduled-workflow clock (see README "Staying alive"). The cache is the
+  fast path; the committed copy is the durable fallback if the cache is
+  evicted. Never commit them by hand from a dev machine.
+- **Email honesty**: `send_email` returns False on failure and `main()`
+  exits 1 — a green run always means a digest was really delivered. Seen
+  is marked ONLY after a confirmed send, and never in dry-run mode.
 - **Local dev run** uses `~/.gemini-cli/auth.json`; CI writes it from secrets.
 - **Cookie refresh**: run `gemini.py --init` (or re-login Firefox) then
   `python3 refresh_gh_secrets.py owner/repo`.
