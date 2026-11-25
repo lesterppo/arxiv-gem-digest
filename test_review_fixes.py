@@ -81,13 +81,18 @@ class _FakeSMTP:
 _FakeSMTP.fail_login = False
 
 
-def _run_main(monkey, env):
-    """Run g.main() with fetch/gemini stubbed and temp state files."""
+def _run_main(monkey, env, seed_deferred=None):
+    """Run g.main() with fetch/gemini stubbed and temp state files.
+    seed_deferred: raw on-disk deferred records (ISO published strings)
+    written before the run, to simulate a legacy backlog file."""
     tmp = tempfile.mkdtemp(prefix="agd-test-")
     monkey_state = os.path.join(tmp, "seen_ids.json")
     monkey_def = os.path.join(tmp, "deferred_ids.json")
     g.STATE_FILE = monkey_state
     g.DEFERRED_FILE = monkey_def
+    if seed_deferred is not None:
+        with open(monkey_def, "w") as f:
+            json.dump(seed_deferred, f)
     g.infographic = None
     g._have_web_auth = lambda: True
     g.fetch_papers = lambda s, e: _fake_papers()
@@ -109,7 +114,11 @@ def _run_main(monkey, env):
     if os.path.exists(monkey_state):
         with open(monkey_state) as f:
             seen = json.load(f)
-    return rc, seen, _FakeSMTP.instances
+    deferred = []
+    if os.path.exists(monkey_def):
+        with open(monkey_def) as f:
+            deferred = json.load(f)
+    return rc, seen, _FakeSMTP.instances, deferred
 
 
 print("== send_email: dry run suppresses and reports success ==")
@@ -134,7 +143,7 @@ finally:
 
 print("== main(): dry run does NOT consume papers ==")
 _FakeSMTP.instances.clear()
-rc, seen, _ = _run_main(None, {"DIGEST_DRY_RUN": "1"})
+rc, seen, _, _ = _run_main(None, {"DIGEST_DRY_RUN": "1"})
 check("dry run exits 0", rc == 0, f"rc={rc}")
 check("dry run marks nothing seen", seen == {}, str(seen))
 
@@ -142,7 +151,7 @@ print("== main(): successful send marks seen ==")
 _FakeSMTP.instances.clear()
 smtplib.SMTP_SSL = _FakeSMTP
 try:
-    rc, seen, inst = _run_main(None, {})
+    rc, seen, inst, _ = _run_main(None, {})
 finally:
     smtplib.SMTP_SSL = _real_smtp
 check("real run exits 0", rc == 0, f"rc={rc}")
@@ -157,7 +166,7 @@ _FakeSMTP.instances.clear()
 _FakeSMTP.fail_login = True
 smtplib.SMTP_SSL = _FakeSMTP
 try:
-    rc, seen, inst = _run_main(None, {})
+    rc, seen, inst, _ = _run_main(None, {})
 finally:
     smtplib.SMTP_SSL = _real_smtp
     _FakeSMTP.fail_login = False
@@ -165,6 +174,58 @@ check("failed send exits non-zero", rc != 0, f"rc={rc}")
 check("failed send marks nothing seen", seen == {}, str(seen))
 check("failed send attempted SMTP (login tried)",
       len(inst) == 1, f"instances={len(inst)}")
+
+print("== deferred queue is bounded (window + cap) ==")
+_now = datetime.now(timezone.utc)
+_cut = _now - timedelta(days=2)
+_tmpd = tempfile.mkdtemp(prefix="agd-def-")
+g.DEFERRED_FILE = os.path.join(_tmpd, "deferred_ids.json")
+_old = [{"id": f"2501.{i:05d}", "title": "old", "authors": [], "summary": "s",
+         "published": _now - timedelta(days=10)} for i in range(300)]
+_new = [{"id": f"2511.{i:05d}", "title": "new", "authors": [], "summary": "s",
+         "published": _now - timedelta(hours=2)} for i in range(5)]
+g._save_deferred(_old + _new, _cut)
+_loaded = g._load_deferred(_cut)
+check("save drops out-of-window papers", len(_loaded) == 5,
+      f"len={len(_loaded)}")
+check("load drops stale entries",
+      all(p["published"] >= _cut for p in _loaded))
+_many = [{"id": f"2511.{i:05d}", "title": "n", "authors": [], "summary": "s",
+         "published": _now - timedelta(hours=1)} for i in range(500)]
+g._save_deferred(_many, _cut)
+_loaded = g._load_deferred(_cut)
+check("save caps the queue at MAX_DEFERRED",
+      len(_loaded) == g.MAX_DEFERRED, f"len={len(_loaded)}")
+check("cap keeps the newest",
+      all(p["id"].startswith("2511.") for p in _loaded))
+
+print("== main(): stale deferred backlog is drained, not carried ==")
+_FakeSMTP.instances.clear()
+smtplib.SMTP_SSL = _FakeSMTP
+try:
+    # 300 stale (10 days old) + 25 fresh overflow at distinct ages 6..30h.
+    # Unknown = 27, cap 22 -> candidates = 2 fetched + 20 newest seeded;
+    # deferred remainder = the 5 oldest seeded. Stale must vanish.
+    _seed = ([{"id": f"2501.{i:05d}", "abs_url": "", "title": "stale",
+               "authors": [], "summary": "s",
+               "published": (_now - timedelta(days=10)).isoformat()}
+             for i in range(300)]
+            + [{"id": f"2511.900{i:02d}", "abs_url": "", "title": "fresh",
+                "authors": [], "summary": "s",
+                "published": (_now - timedelta(hours=6 + i)).isoformat()}
+               for i in range(25)])
+    rc, seen, inst, def_after = _run_main(None, {}, seed_deferred=_seed)
+finally:
+    smtplib.SMTP_SSL = _real_smtp
+check("stale-backlog run exits 0", rc == 0, f"rc={rc}")
+check("stale backlog dropped (only in-window overflow kept)",
+      len(def_after) == 5, f"len={len(def_after)}")
+check("kept deferred are the 5 oldest in-window overflow",
+      {p["id"] for p in def_after} == {f"2511.900{i:02d}" for i in range(20, 25)},
+      str([p["id"] for p in def_after]))
+check("run analysed the fresh candidates (cap 22)",
+      len(seen) == 22 and "2511.00001" in seen and "2511.00002" in seen,
+      f"seen={len(seen)}")
 
 print("== NotebookLM run-relative budget ==")
 check("over budget (700s > 600s) skips NLM",
